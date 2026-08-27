@@ -66,6 +66,12 @@ sync_mysql() {
       remote "rm -f '${remote_tmp}'"
       INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
       log_ok "Imported ${db_name}"
+    elif remote_mysql_import_gz "${db_name}" "${remote_tmp}"; then
+      echo "${new_sum}" >"${checksum_file}"
+      [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
+      remote "rm -f '${remote_tmp}'"
+      INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
+      log_ok "Imported ${db_name} via mysql client"
     else
       log_error "Import failed for ${db_name}"
       return 1

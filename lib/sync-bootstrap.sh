@@ -3,7 +3,21 @@
 
 _panel_has_database() {
   local db_name="$1"
-  remote "sqlite3 '${CLP_DB_PATH}' \"SELECT id FROM \\\"database\\\" WHERE name = '$(sql_escape "${db_name}")' LIMIT 1;\"" 2>/dev/null || true
+  remote bash -s -- "${CLP_DB_PATH}" "${db_name}" <<'EOS'
+python3 - "$1" "$2" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+name = sys.argv[2]
+for table in ("database", "databases"):
+    try:
+        row = con.execute(f'SELECT id FROM "{table}" WHERE name = ? LIMIT 1', (name,)).fetchone()
+        if row:
+            print(row[0])
+            break
+    except sqlite3.Error:
+        pass
+PY
+EOS
 }
 
 bootstrap_site_on_standby() {
@@ -145,66 +159,165 @@ _clpctl_db_add() {
   local domain="$1" db_name="$2" db_user="$3" password="$4"
   local logf="/var/tmp/clp-sync-import/db-add.log"
   remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
-  remote bash -s -- "${domain}" "${db_name}" "${db_user}" "${password}" "${logf}" <<'EOS'
+  remote bash -s -- "${domain}" "${db_name}" "${db_user}" "${password}" "${logf}" "${CLP_DB_PATH}" <<'EOS'
 set +e
-domain="$1"; db_name="$2"; db_user="$3"; password="$4"; logf="$5"
+domain="$1"; db_name="$2"; db_user="$3"; password="$4"; logf="$5"; panel_db="$6"
 {
-  echo "clpctl db:add domain=${domain} db=${db_name} user=${db_user}"
-  clpctl db:add \
-    --domainName="${domain}" \
-    --databaseName="${db_name}" \
-    --databaseUserName="${db_user}" \
-    --databaseUserPassword="${password}"
-  echo "EXIT=$?"
+  echo "==== env ===="
+  echo "clpctl=$(command -v clpctl)"
+  file "$(command -v clpctl)" 2>/dev/null || true
+  echo "tty=$(tty 2>/dev/null || true) script=$(command -v script || true)"
+  echo "==== panel sites ===="
+  sqlite3 "${panel_db}" "SELECT id, domain_name, user FROM site;" 2>/dev/null || true
+  echo "==== panel databases ===="
+  sqlite3 "${panel_db}" 'SELECT id, site_id, name FROM "database";' 2>/dev/null || true
+  echo "==== panel database_user ===="
+  sqlite3 "${panel_db}" 'SELECT id, database_id, user_name FROM database_user;' 2>/dev/null || true
+  echo "==== clpctl db:add ===="
+  echo "domain=${domain} db=${db_name} user=${db_user}"
+  export CLP_SYNC_DOMAIN="${domain}"
+  export CLP_SYNC_DB_NAME="${db_name}"
+  export CLP_SYNC_DB_USER="${db_user}"
+  export CLP_SYNC_DB_PASS="${password}"
+  add_sh='clpctl -vvv db:add --domainName="$CLP_SYNC_DOMAIN" --databaseName="$CLP_SYNC_DB_NAME" --databaseUserName="$CLP_SYNC_DB_USER" --databaseUserPassword="$CLP_SYNC_DB_PASS"'
+  if command -v script >/dev/null 2>&1; then
+    script -qefc "${add_sh}" /var/tmp/clp-sync-import/db-add.tty </dev/null
+    echo "EXIT=$?"
+    echo "==== tty capture ===="
+    cat /var/tmp/clp-sync-import/db-add.tty 2>/dev/null || true
+  else
+    eval "${add_sh}" </dev/null
+    echo "EXIT=$?"
+  fi
+  echo "==== cloudpanel php logs ===="
+  ls -lt /home/clp/htdocs/app/var/log 2>/dev/null | head -20
+  tail -n 40 /home/clp/htdocs/app/var/log/*.log 2>/dev/null || true
 } >"${logf}" 2>&1
+python3 - "${logf}" <<'PY'
+import re, sys
+p = sys.argv[1]
+t = open(p, errors="replace").read()
+t = re.sub(r"(databaseUserPassword[=: ]+)\S+", r"\1***", t)
+t = re.sub(r"(IDENTIFIED BY ')[^']*", r"\1***", t)
+open(p, "w").write(t)
+PY
 exit 0
 EOS
   remote "cat ${logf}" || true
 }
 
-_standby_drop_mysql_db_user() {
+_standby_purge_panel_db_rows() {
   local db_name="$1" db_user="$2"
-  remote_mysql_sql "DROP DATABASE IF EXISTS \`${db_name}\`; DROP USER IF EXISTS '${db_user}'@'localhost'; DROP USER IF EXISTS '${db_user}'@'127.0.0.1'; DROP USER IF EXISTS '${db_user}'@'%'; FLUSH PRIVILEGES;"
+  remote bash -s -- "${CLP_DB_PATH}" "${db_name}" "${db_user}" <<'EOS'
+python3 - "$1" "$2" "$3" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+db_name, db_user = sys.argv[2], sys.argv[3]
+try:
+    con.execute("DELETE FROM database_user WHERE user_name = ?", (db_user,))
+except sqlite3.Error:
+    pass
+for table in ("database", "databases"):
+    try:
+        con.execute(f'DELETE FROM "{table}" WHERE name = ?', (db_name,))
+    except sqlite3.Error:
+        pass
+con.commit()
+print("purged panel sqlite rows for", db_name, db_user)
+PY
+EOS
+}
+
+_standby_ensure_mysql_database() {
+  local db_name="$1" db_user="$2" password="$3"
+  local sql_db sql_user sql_pass
+  if [[ ! "${db_name}" =~ ^[A-Za-z0-9_]+$ ]] || [[ ! "${db_user}" =~ ^[A-Za-z0-9_]+$ ]]; then
+    log_error "Refusing unsafe MySQL identifier db=${db_name} user=${db_user}"
+    return 1
+  fi
+  sql_db="${db_name}"
+  sql_user="${db_user}"
+  sql_pass="$(printf '%s' "${password}" | sed "s/'/''/g")"
+  remote_mysql_sql "$(cat <<SQL
+CREATE DATABASE IF NOT EXISTS \`${sql_db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${sql_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
+CREATE USER IF NOT EXISTS '${sql_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
+ALTER USER IF EXISTS '${sql_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
+ALTER USER IF EXISTS '${sql_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
+GRANT ALL PRIVILEGES ON \`${sql_db}\`.* TO '${sql_user}'@'localhost';
+GRANT ALL PRIVILEGES ON \`${sql_db}\`.* TO '${sql_user}'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+)"
 }
 
 bootstrap_database_on_standby() {
   local domain="$1" db_name="$2" db_user="$3" site_user="$4"
-  local password exists add_out
+  local password app_pass mysql_pass exists add_out site_exists
 
   [[ -n "${db_name}" ]] || return 0
   [[ -n "${db_user}" ]] || db_user="${db_name}"
+  domain="${domain//$'\r'/}"
+  site_user="${site_user//$'\r'/}"
 
   exists="$(_panel_has_database "${db_name}")"
   if [[ -n "${exists}" ]]; then
-    log_info "Standby already has database ${db_name}"
+    log_info "Standby panel already has database ${db_name} (id=${exists})"
+    if app_pass="$(guess_db_password "${site_user}" "${domain}" "${db_name}")"; then
+      _standby_ensure_mysql_database "${db_name}" "${db_user}" "${app_pass}" || true
+    fi
     return 0
   fi
 
-  # clpctl rejects many app .env passwords (policy). Use a compliant password;
-  # sync_mysql reconcile_db_passwords will set the real app password after import.
-  password="Clp$(openssl rand -hex 8)Aa1!"
+  if [[ -z "${domain}" ]]; then
+    log_error "Cannot create database ${db_name}: empty domain"
+    return 1
+  fi
+
+  site_exists="$(remote "sqlite3 '${CLP_DB_PATH}' \"SELECT id FROM site WHERE domain_name = '$(sql_escape "${domain}")' LIMIT 1;\"")" || true
+  if [[ -z "${site_exists}" ]]; then
+    log_warn "Site ${domain} is missing on standby; creating it before database ${db_name}"
+    bootstrap_site_on_standby "${domain}" "${site_user}" php 8.3 Generic || return 1
+  fi
+
+  # clpctl rejects many app .env passwords. Use a policy-safe password for the
+  # panel CLI; MySQL user is set to the real app password so the site works.
+  password="Clp$(openssl rand -hex 8)Aa1#"
+  mysql_pass="${password}"
+  if app_pass="$(guess_db_password "${site_user}" "${domain}" "${db_name}")"; then
+    mysql_pass="${app_pass}"
+  fi
 
   log_info "Creating database ${db_name} for ${domain} on standby"
   add_out="$(_clpctl_db_add "${domain}" "${db_name}" "${db_user}" "${password}")"
   if [[ "${add_out}" == *EXIT=0* ]] || [[ "${add_out}" == *"has been added"* ]]; then
-    log_ok "Created database ${db_name}"
+    log_ok "Created database ${db_name} via clpctl"
+    _standby_ensure_mysql_database "${db_name}" "${db_user}" "${mysql_pass}" || true
     return 0
   fi
 
-  log_warn "db:add failed for ${db_name}:"
+  log_warn "clpctl db:add failed for ${db_name} (full output follows)"
   printf '%s\n' "${add_out}" >&2
 
-  log_info "Dropping orphan MySQL objects for ${db_name} on standby, then retrying"
-  _standby_drop_mysql_db_user "${db_name}" "${db_user}" || true
+  # Leftover panel rows (not MySQL DROP) are what usually block a retry.
+  log_info "Removing leftover CloudPanel sqlite rows for ${db_name}, then retrying db:add"
+  _standby_purge_panel_db_rows "${db_name}" "${db_user}" || true
 
   add_out="$(_clpctl_db_add "${domain}" "${db_name}" "${db_user}" "${password}")"
   if [[ "${add_out}" == *EXIT=0* ]] || [[ "${add_out}" == *"has been added"* ]]; then
-    log_ok "Created database ${db_name} after cleanup"
+    log_ok "Created database ${db_name} via clpctl after panel sqlite cleanup"
+    _standby_ensure_mysql_database "${db_name}" "${db_user}" "${mysql_pass}" || true
     return 0
   fi
 
-  log_error "db:add still failed for ${db_name}:"
+  log_warn "clpctl db:add still failed; creating MySQL database ${db_name} directly so import can proceed"
   printf '%s\n' "${add_out}" >&2
+  if _standby_ensure_mysql_database "${db_name}" "${db_user}" "${mysql_pass}"; then
+    log_ok "MySQL database ${db_name} exists on standby (panel UI may not list it until db:add works)"
+    return 0
+  fi
+
+  log_error "Could not create MySQL database ${db_name} on standby"
   return 1
 }
 
@@ -212,12 +325,15 @@ run_bootstrap() {
   local db_snap="$1"
   local id domain user type php_ver vhost
   local site_id domain_name site_user db_name db_user
-  local n
+  local n db_fail=0
 
   n="$(inventory_sites "${db_snap}" | grep -c . || true)"
   log_info "Bootstrapping missing sites on standby (${n} site(s) in master inventory)"
   while IFS=$'\t' read -r id domain user type php_ver vhost; do
-    [[ -n "${domain}" ]] || continue
+    if [[ -z "${domain}" ]]; then
+      log_warn "Skipping site id=${id:-?} user=${user:-?} (empty domain_name)"
+      continue
+    fi
     log_info "Inventory site: ${domain} user=${user} type=${type}"
     bootstrap_site_on_standby "${domain}" "${user}" "${type}" "${php_ver}" "${vhost}"
   done < <(inventory_sites "${db_snap}")
@@ -225,6 +341,12 @@ run_bootstrap() {
   log_info "Bootstrapping missing databases on standby"
   while IFS=$'\t' read -r site_id domain_name site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
-    bootstrap_database_on_standby "${domain_name}" "${db_name}" "${db_user}" "${site_user}"
+    if ! bootstrap_database_on_standby "${domain_name}" "${db_name}" "${db_user}" "${site_user}"; then
+      db_fail=$((db_fail + 1))
+    fi
   done < <(inventory_databases "${db_snap}")
+  if [[ "${db_fail}" -gt 0 ]]; then
+    log_error "${db_fail} database(s) failed to bootstrap on standby"
+    return 1
+  fi
 }

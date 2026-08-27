@@ -102,6 +102,94 @@ dump_database() {
   clpctl db:export --databaseName="${db_name}" --file="${dest}"
 }
 
+# Run mysql on the standby using CloudPanel master credentials.
+# mode: query <sql> | exec-file <path> | import-gz <db> <gz>
+_remote_mysql() {
+  remote bash -s -- "$@" <<'EOS'
+set -euo pipefail
+python3 - "$@" <<'PY'
+import os, re, subprocess, sys, tempfile
+
+mode = sys.argv[1]
+args = sys.argv[2:]
+
+def grab(text, *labels):
+    for lab in labels:
+        m = re.search(rf'(?im)(?:\|\s*)?{lab}\s*(?:\||:)\s*([^\s|]+)', text)
+        if m:
+            return m.group(1).strip().strip("'\"")
+    return ""
+
+def mysql_cmd():
+    try:
+        subprocess.check_call(
+            ["mysql", "--batch", "-N", "-e", "SELECT 1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return ["mysql"], None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    out = subprocess.check_output(
+        ["clpctl", "db:show:master-credentials"],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    user = grab(out, "User Name", "UserName", "Username", "User") or "root"
+    password = grab(out, "Password")
+    host = grab(out, "Host") or "127.0.0.1"
+    port = grab(out, "Port") or "3306"
+    m = re.search(r"-p'([^']+)'", out)
+    if m:
+        password = m.group(1)
+    if not password:
+        sys.exit("no mysql password from clpctl on standby")
+    fd, cnf = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
+    os.chmod(cnf, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(f"[client]\nuser={user}\npassword={password}\nhost={host}\nport={port}\n")
+    return ["mysql", f"--defaults-extra-file={cnf}"], cnf
+
+cmd, cnf = mysql_cmd()
+try:
+    if mode == "query":
+        subprocess.check_call(cmd + ["--batch", "-N", "-e", args[0]])
+    elif mode == "exec-file":
+        with open(args[0]) as stdin:
+            subprocess.check_call(cmd, stdin=stdin)
+    elif mode == "import-gz":
+        db, gz = args[0], args[1]
+        if not re.fullmatch(r"[A-Za-z0-9_]+", db):
+            sys.exit(f"refusing unsafe database name: {db}")
+        subprocess.check_call(
+            cmd
+            + [
+                "--batch",
+                "-N",
+                "-e",
+                f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            ]
+        )
+        gunzip = subprocess.Popen(["gunzip", "-c", gz], stdout=subprocess.PIPE)
+        mysql_rc = subprocess.call(cmd + [db], stdin=gunzip.stdout)
+        if gunzip.stdout:
+            gunzip.stdout.close()
+        gunzip.wait()
+        if mysql_rc != 0:
+            sys.exit(f"mysql import failed: {mysql_rc}")
+    else:
+        sys.exit(f"unknown mysql mode: {mode}")
+finally:
+    if cnf:
+        os.unlink(cnf)
+PY
+EOS
+}
+
+remote_mysql_query() {
+  _remote_mysql query "$1"
+}
+
 # Run a SQL string on the standby with CloudPanel MySQL credentials.
 remote_mysql_sql() {
   local sql="$1"
@@ -118,44 +206,10 @@ remote_mysql_sql() {
 
 # Run a SQL file on the standby with that host's CloudPanel MySQL credentials.
 remote_mysql_file() {
-  local remote_sql="$1"
-  remote bash -s -- "${remote_sql}" <<'EOS'
-set -euo pipefail
-SQL="$1"
-if mysql --batch -N -e "SELECT 1" >/dev/null 2>&1; then
-  mysql < "${SQL}"
-  exit 0
-fi
-python3 - "${SQL}" <<'PY'
-import os, re, subprocess, sys, tempfile
-sql_path = sys.argv[1]
-out = subprocess.check_output(["clpctl", "db:show:master-credentials"], text=True, stderr=subprocess.STDOUT)
+  _remote_mysql exec-file "$1"
+}
 
-def grab(*labels):
-    for lab in labels:
-        m = re.search(rf'(?im)(?:\|\s*)?{lab}\s*(?:\||:)\s*([^\s|]+)', out)
-        if m:
-            return m.group(1).strip().strip("'\"")
-    return ""
-
-user = grab("User Name", "UserName", "Username", "User") or "root"
-password = grab("Password")
-host = grab("Host") or "127.0.0.1"
-port = grab("Port") or "3306"
-m = re.search(r"-p'([^']+)'", out)
-if m:
-    password = m.group(1)
-if not password:
-    sys.exit("no mysql password from clpctl on standby")
-fd, cnf = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
-os.chmod(cnf, 0o600)
-with os.fdopen(fd, "w") as f:
-    f.write(f"[client]\nuser={user}\npassword={password}\nhost={host}\nport={port}\n")
-try:
-    with open(sql_path) as stdin:
-        subprocess.check_call(["mysql", f"--defaults-extra-file={cnf}"], stdin=stdin)
-finally:
-    os.unlink(cnf)
-PY
-EOS
+remote_mysql_import_gz() {
+  local db_name="$1" remote_gz="$2"
+  _remote_mysql import-gz "${db_name}" "${remote_gz}"
 }

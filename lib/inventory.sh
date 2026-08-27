@@ -18,7 +18,7 @@ inventory_snapshot() {
 inventory_sites() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
   python3 - "${db}" <<'PY'
-import sqlite3, sys
+import re, sqlite3, sys
 db = sys.argv[1]
 con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
@@ -32,9 +32,17 @@ php_table = "php_settings" if "php_settings" in {
 } else None
 
 def pick(row, *names, default=""):
+    keys = {str(k).lower(): k for k in row.keys()}
     for n in names:
-        if n in row.keys() and row[n] is not None:
-            return str(row[n]).replace("\r", "").replace("\n", " ").replace("\t", " ")
+        k = keys.get(n.lower())
+        if k is None:
+            continue
+        v = row[k]
+        if v is None:
+            continue
+        s = str(v).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+        if s:
+            return s
     return default
 
 type_map = {
@@ -57,11 +65,16 @@ if php_table:
 
 for row in con.execute("SELECT * FROM site ORDER BY id"):
     sid = row["id"]
-    domain = pick(row, "domain_name", "domain")
+    domain = pick(row, "domain_name", "domain", "domainName")
+    if not domain:
+        vt = pick(row, "vhost_template", "vhost", "nginx_vhost")
+        m = re.search(r"(?i)vhost for ([A-Za-z0-9.-]+)", vt)
+        if m:
+            domain = m.group(1)
     user = pick(row, "user", "site_user", "username")
     raw_type = pick(row, "type", "site_type").strip().lower()
     site_type = type_map.get(raw_type, "php")
-    php_ver = str(php_by_site.get(sid, "") or "8.3")
+    php_ver = str(php_by_site.get(sid, "") or "8.3").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip() or "8.3"
     # Never emit stored nginx; rsync copies real vhosts.
     print("\t".join([str(sid), domain, user, site_type, php_ver, "Generic"]))
 PY
@@ -89,35 +102,62 @@ inventory_ftp_usernames() {
 inventory_databases() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
   python3 - "${db}" <<'PY'
-import sqlite3, sys
+import re, sqlite3, sys
 db = sys.argv[1]
 con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
 tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 db_table = "database" if "database" in tables else ("databases" if "databases" in tables else None)
 if not db_table:
     sys.exit(0)
+
+def clean(v):
+    if v is None:
+        return ""
+    return str(v).replace("\t", " ").replace("\n", " ").replace("\r", " ").strip()
+
+def domain_of(site_id, fallback=""):
+    row = con.execute("SELECT * FROM site WHERE id = ?", (site_id,)).fetchone()
+    if not row:
+        return fallback
+    keys = {str(k).lower(): k for k in row.keys()}
+    for n in ("domain_name", "domain", "domainName"):
+        k = keys.get(n.lower())
+        if k is not None:
+            s = clean(row[k])
+            if s:
+                return s
+    for n in ("vhost_template", "vhost", "nginx_vhost"):
+        k = keys.get(n.lower())
+        if k is None:
+            continue
+        m = re.search(r"(?i)vhost for ([A-Za-z0-9.-]+)", clean(row[k]))
+        if m:
+            return m.group(1)
+    return fallback
+
+du_join = ""
+du_col = "d.name"
+if "database_user" in tables:
+    du_join = "LEFT JOIN database_user du ON du.database_id = d.id"
+    du_col = "COALESCE(du.user_name, '')"
+
 q = f'''
-SELECT s.id, s.domain_name, s.user, d.name, COALESCE(du.user_name, '')
+SELECT s.id AS site_id, s.user AS site_user, d.name AS db_name, {du_col} AS db_user
 FROM site s
 JOIN "{db_table}" d ON d.site_id = s.id
-LEFT JOIN database_user du ON du.database_id = d.id
+{du_join}
 ORDER BY d.name
 '''
-try:
-    for row in con.execute(q):
-        vals = [("" if x is None else str(x).replace("\t"," ").replace("\n"," ")) for x in row]
-        print("\t".join(vals))
-except sqlite3.Error:
-    # database_user table may be named differently
-    q2 = f'''
-    SELECT s.id, s.domain_name, s.user, d.name, d.name
-    FROM site s
-    JOIN "{db_table}" d ON d.site_id = s.id
-    ORDER BY d.name
-    '''
-    for row in con.execute(q2):
-        vals = [("" if x is None else str(x).replace("\t"," ").replace("\n"," ")) for x in row]
-        print("\t".join(vals))
+for row in con.execute(q):
+    domain = domain_of(row["site_id"])
+    print("\t".join([
+        clean(row["site_id"]),
+        domain,
+        clean(row["site_user"]),
+        clean(row["db_name"]),
+        clean(row["db_user"]) or clean(row["db_name"]),
+    ]))
 PY
 }
 
