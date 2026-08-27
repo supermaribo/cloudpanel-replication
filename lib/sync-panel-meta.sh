@@ -220,22 +220,28 @@ sync_panel_app_secret() {
 }
 
 _standby_panel_user_summary() {
-  remote bash -s -- "${CLP_DB_PATH}" <<'EOS'
+  remote bash -s -- "${1:-${CLP_DB_PATH}}" <<'EOS'
 python3 - "$1" <<'PY'
 import sqlite3, sys
-con = sqlite3.connect(sys.argv[1])
-tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+path = sys.argv[1]
+try:
+    con = sqlite3.connect(path, timeout=15)
+    tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+except sqlite3.Error as e:
+    print("0")
+    print(f"sqlite-open-failed\t{e}", file=sys.stderr)
+    sys.exit(1)
 table = "user" if "user" in tables else ("users" if "users" in tables else None)
 if not table:
     print("0")
     sys.exit(0)
-cols = {r[1] for r in con.execute(f'PRAGMA table_info("{table}")')}
+cols = [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
 name_col = "user_name" if "user_name" in cols else ("username" if "username" in cols else None)
 role_col = "role" if "role" in cols else None
 rows = list(con.execute(f'SELECT * FROM "{table}"'))
 print(len(rows))
 for row in rows:
-    m = dict(zip([r[1] for r in con.execute(f'PRAGMA table_info("{table}")')], row))
+    m = dict(zip(cols, row))
     name = m.get(name_col) or m.get("email") or "?"
     role = m.get(role_col) or ""
     print(f"{name}\t{role}")
@@ -270,20 +276,45 @@ set -euo pipefail
 CLP_DB="$1"
 SRC="$2"
 install -d -m 755 -o clp -g clp "$(dirname "$CLP_DB")"
-# Drop WAL/SHM first — replaying an old WAL onto a replaced db.sq3 corrupts it
-# and can leave the user table empty (Admin User Creation wizard).
-rm -f "${CLP_DB}-wal" "${CLP_DB}-shm" "${CLP_DB}.new"
+
+ok="$(sqlite3 "$SRC" "PRAGMA integrity_check;" 2>/dev/null || true)"
+if [[ "${ok}" != "ok" ]]; then
+  echo "snapshot integrity_check failed: ${ok}" >&2
+  ls -l "$SRC" "$(dirname "$CLP_DB")" >&2 || true
+  df -h "$(dirname "$CLP_DB")" /var/lib/clp-sync /var/tmp >&2 || true
+  exit 1
+fi
+
+units=$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null \
+  | awk '{print $1}' | grep -E 'php[0-9.]*-fpm|clp-php-fpm' || true)
+for s in $units; do
+  echo "stopping $s so db.sq3 can be replaced"
+  systemctl stop "$s" || true
+done
+
+rm -f "${CLP_DB}-wal" "${CLP_DB}-shm" "${CLP_DB}-journal" "${CLP_DB}.new"
 cp -a "$SRC" "${CLP_DB}.new"
 chown clp:clp "${CLP_DB}.new"
 chmod 660 "${CLP_DB}.new"
+sync
 mv -f "${CLP_DB}.new" "$CLP_DB"
-rm -f "${CLP_DB}-wal" "${CLP_DB}-shm"
-rm -rf /home/clp/htdocs/app/var/cache/* 2>/dev/null || true
-for s in php*-fpm; do systemctl reload "$s" 2>/dev/null || true; done
+rm -f "${CLP_DB}-wal" "${CLP_DB}-shm" "${CLP_DB}-journal"
+sync
+
+live_ok="$(sqlite3 "$CLP_DB" "PRAGMA integrity_check;" 2>/dev/null || true)"
+if [[ "${live_ok}" != "ok" ]]; then
+  echo "live db.sq3 integrity_check failed after replace: ${live_ok}" >&2
+  ls -l "$CLP_DB" >&2 || true
+fi
+
+for s in $units; do
+  echo "starting $s"
+  systemctl start "$s" || true
+done
 true
 EOS
 
-  summary="$(_standby_panel_user_summary || true)"
+  summary="$(_standby_panel_user_summary "${remote_copy}" || true)"
   n="$(printf '%s\n' "${summary}" | head -1)"
   if [[ -z "${n}" || "${n}" == "0" ]]; then
     log_error "Standby panel user table is still empty — Admin User Creation will remain"
