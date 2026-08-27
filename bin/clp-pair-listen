@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Standby pairing listener — accepts master SSH public key once, then exits.
+# Usage: clp-pair-listen [--port 18765] [--token FILE_OR_VALUE] [--bind IP]
+set -euo pipefail
+
+PORT=18765
+TOKEN_FILE=/etc/clp-sync/pair.token
+BIND=""
+TOKEN=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --token) TOKEN="$2"; shift 2 ;;
+    --bind) BIND="$2"; shift 2 ;;
+    *) echo "Unknown: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "${TOKEN}" && -f "${TOKEN_FILE}" ]]; then
+  TOKEN="$(tr -d '[:space:]' <"${TOKEN_FILE}")"
+fi
+[[ -n "${TOKEN}" ]] || { echo "No pairing token" >&2; exit 1; }
+
+if [[ -z "${BIND}" ]]; then
+  BIND="$(tailscale ip -4 2>/dev/null | head -1 || echo 0.0.0.0)"
+fi
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+
+echo "Listening for master pair on ${BIND}:${PORT} (Ctrl+C to cancel)..."
+echo "Token configured. Waiting for one successful pair..."
+
+export CLP_PAIR_TOKEN="${TOKEN}"
+export CLP_PAIR_BIND="${BIND}"
+export CLP_PAIR_PORT="${PORT}"
+
+python3 - <<'PY'
+import os, socket, sys
+
+token = os.environ["CLP_PAIR_TOKEN"].strip()
+bind = os.environ["CLP_PAIR_BIND"]
+port = int(os.environ["CLP_PAIR_PORT"])
+auth_keys = "/root/.ssh/authorized_keys"
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((bind, port))
+srv.listen(1)
+srv.settimeout(1800)  # 30 minutes
+
+try:
+    conn, addr = srv.accept()
+except socket.timeout:
+    print("Timed out waiting for master", file=sys.stderr)
+    sys.exit(1)
+
+with conn:
+    conn.settimeout(60)
+    data = b""
+    while b"\n.\n" not in data and len(data) < 16384:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+
+    text = data.decode("utf-8", errors="replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and ln.strip() != "."]
+    got_token = ""
+    pubkey = ""
+    for ln in lines:
+        if ln.startswith("TOKEN="):
+            got_token = ln[6:].strip()
+        elif ln.startswith("PUBKEY="):
+            pubkey = ln[7:].strip()
+        elif ln.startswith("ssh-") or ln.startswith("ecdsa-") or ln.startswith("sk-"):
+            pubkey = ln
+
+    if got_token != token:
+        conn.sendall(b"ERR bad token\n")
+        print("Rejected pair from %s (bad token)" % (addr,), file=sys.stderr)
+        sys.exit(2)
+
+    if not pubkey.startswith(("ssh-", "ecdsa-", "sk-")):
+        conn.sendall(b"ERR bad pubkey\n")
+        print("Rejected pair from %s (bad pubkey)" % (addr,), file=sys.stderr)
+        sys.exit(3)
+
+    # Deduplicate
+    existing = open(auth_keys).read() if os.path.exists(auth_keys) else ""
+    marker = "clp-sync-master"
+    # Normalize line with comment
+    if " " in pubkey and not pubkey.endswith(marker):
+        # keep as-is; append marker comment if missing
+        parts = pubkey.split()
+        if len(parts) >= 2:
+            pubkey = f"{parts[0]} {parts[1]} {marker}"
+
+    if pubkey.split()[1] not in existing:
+        with open(auth_keys, "a") as f:
+            f.write(pubkey + "\n")
+        os.chmod(auth_keys, 0o600)
+
+    conn.sendall(b"OK paired\n")
+    print("Paired successfully with %s" % (addr[0],))
+    # Mark ready
+    open("/var/lib/clp-sync/standby-ready", "w").write("paired\n")
+    # Clear one-time token
+    try:
+        os.remove("/etc/clp-sync/pair.token")
+    except FileNotFoundError:
+        pass
+PY

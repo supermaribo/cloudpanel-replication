@@ -44,7 +44,7 @@ load_config() {
   # shellcheck disable=SC1090
   set -a; source "${cfg}"; set +a
 
-  : "${STANDBY_HOST:?STANDBY_HOST required}"
+  : "${ROLE:=master}"
   : "${STANDBY_SSH_USER:=root}"
   : "${STANDBY_SSH_PORT:=22}"
   : "${CLP_DB_PATH:=/home/clp/htdocs/app/data/db.sq3}"
@@ -59,6 +59,12 @@ load_config() {
   : "${APPLY_PANEL_DB:=1}"
   : "${SYNC_EXTRA_USERS:=clp}"
   : "${FAIL_NOTIFY_CMD:=}"
+  : "${PRIMARY_HOST:=}"
+  : "${STANDBY_HOST:=}"
+
+  if [[ "${ROLE}" == "master" && -z "${STANDBY_HOST}" ]]; then
+    die "STANDBY_HOST required for ROLE=master"
+  fi
 
   mkdir -p "${CLP_SYNC_STATE_DIR}" "${CLP_SYNC_TMP_DIR}" "${CLP_SYNC_LOG_DIR}"
   chmod 700 "${CLP_SYNC_STATE_DIR}" "${CLP_SYNC_TMP_DIR}"

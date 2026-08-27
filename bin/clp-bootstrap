@@ -13,6 +13,10 @@ source "${ROOT}/lib/sync-bootstrap.sh"
 require_root
 load_config
 
+if [[ "${ROLE:-master}" == "standby" ]]; then
+  die "This host is ROLE=standby — run bootstrap only on the master"
+fi
+
 CLP_SYNC_LOG_FILE="${CLP_SYNC_LOG_DIR}/bootstrap-$(date -u +%Y%m%d).log"
 touch "${CLP_SYNC_LOG_FILE}"
 chmod 600 "${CLP_SYNC_LOG_FILE}"

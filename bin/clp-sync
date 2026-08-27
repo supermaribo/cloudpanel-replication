@@ -63,6 +63,10 @@ done
 require_root
 load_config
 
+if [[ "${ROLE:-master}" == "standby" ]]; then
+  die "This host is ROLE=standby — run sync only on the master"
+fi
+
 : "${APPLY_PANEL_DB:=1}"
 : "${SYNC_EXTRA_USERS:=clp}"
 
