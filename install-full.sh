@@ -45,9 +45,13 @@ for pkg in git curl ca-certificates; do
   dpkg -s "${pkg}" >/dev/null 2>&1 || need_pkg+=("${pkg}")
 done
 if ((${#need_pkg[@]})); then
+  if [[ "${CLP_SYNC_SKIP_APT:-0}" == "1" ]]; then
+    err "Missing packages: ${need_pkg[*]} — install manually or unset CLP_SYNC_SKIP_APT"
+    exit 1
+  fi
   info "Installing: ${need_pkg[*]}"
   apt-get update -y
-  apt-get install -y "${need_pkg[@]}"
+  apt-get install -y --no-install-recommends "${need_pkg[@]}"
 fi
 ok "git, curl available"
 

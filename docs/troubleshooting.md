@@ -4,6 +4,33 @@ Common issues and fixes.
 
 ---
 
+## URGENT: apt removed MariaDB / reinstalled MySQL
+
+**What happened:** An older installer ran `apt-get install mysql-client` if `mysqldump` was missing. CloudPanel uses **MariaDB** — installing Oracle MySQL client/server packages can **remove and replace** MariaDB. This must never run on a live master.
+
+**Stop sync now (master):**
+
+```bash
+systemctl stop clp-sync.timer clp-sync.service
+```
+
+**Check damage:**
+
+```bash
+systemctl status mariadb mysql
+dpkg -l | grep -E 'maria|mysql'
+```
+
+**Recovery:** Restore from backup/snapshot if databases are down. Reinstall MariaDB via CloudPanel docs/support. Do not run `apt install mysql-server` blindly.
+
+**Fixed in latest repo:** installer never auto-installs mysql-client. Use:
+
+```bash
+CLP_SYNC_SKIP_APT=1 ./bin/install.sh
+```
+
+---
+
 ## Install / pairing
 
 ### `Tailscale not connected`

@@ -115,7 +115,10 @@ fi
 # --------------------------------------------------------------------------
 # MASTER
 # --------------------------------------------------------------------------
-ensure_packages_master
+ensure_packages_master || {
+  c_warn "Package check failed — continue with CLP_SYNC_SKIP_APT=1 if tools exist"
+  ask_yn "Continue anyway?" "n" || exit 1
+}
 
 c_info "Master mode: CloudPanel data is only READ — sites/DBs/users are not modified."
 echo "  (Local sync state under /var/lib/clp-sync and temp dumps only.)"

@@ -7,6 +7,39 @@ set -euo pipefail
 INSTALL_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DEST="${DEST:-/opt/clp-sync}"
 PAIR_PORT="${PAIR_PORT:-18765}"
+# Set CLP_SYNC_SKIP_APT=1 to never run apt-get (recommended on production CloudPanel)
+CLP_SYNC_SKIP_APT="${CLP_SYNC_SKIP_APT:-0}"
+
+# CloudPanel uses MariaDB — NEVER apt-install mysql-client (conflicts with mariadb-server).
+has_mysqldump() {
+  command -v mysqldump >/dev/null 2>&1 && return 0
+  [[ -x /usr/bin/mysqldump ]] && return 0
+  return 1
+}
+
+safe_apt_install() {
+  # Only install harmless CLI tools — never mysql/mariadb/nginx/php packages.
+  local need=("$@")
+  local blocked=(mysql-client default-mysql-client mysql-server mariadb-server mariadb-client nginx php)
+  local pkg
+  if [[ "${CLP_SYNC_SKIP_APT}" == "1" ]]; then
+    c_warn "CLP_SYNC_SKIP_APT=1 — skipping apt-get (missing: ${need[*]})"
+    return 0
+  fi
+  for pkg in "${need[@]}"; do
+    for b in "${blocked[@]}"; do
+      [[ "${pkg}" == *"${b}"* ]] && {
+        c_err "Refusing to apt-install '${pkg}' on CloudPanel (would conflict with stack)"
+        return 1
+      }
+    done
+  done
+  if ((${#need[@]})); then
+    c_info "Installing CLI tools only: ${need[*]}"
+    apt-get update -y
+    apt-get install -y --no-install-recommends "${need[@]}"
+  fi
+}
 
 c_info()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 c_ok()    { printf '\033[1;32mOK\033[0m  %s\n' "$*"; }
@@ -142,35 +175,45 @@ EOF
 }
 
 ensure_packages_master() {
-  c_info "Checking packages on master (read tools only)"
-  local need=()
-  for p in rsync sqlite3 openssl openssh-client; do
+  c_info "Checking packages on master (read-only tools — no CloudPanel stack changes)"
+  local need=() missing=()
+  for p in rsync sqlite3 openssl openssh-client flock; do
     command -v "${p}" >/dev/null 2>&1 || need+=("${p}")
   done
-  command -v mysqldump >/dev/null 2>&1 || need+=("mysql-client")
-  if ((${#need[@]})); then
-    apt-get update -y
-    apt-get install -y "${need[@]}" || apt-get install -y rsync sqlite3 openssl openssh-client default-mysql-client || true
+  if ! has_mysqldump; then
+    c_err "mysqldump not found."
+    echo "  CloudPanel ships MariaDB — do NOT install mysql-client (breaks MariaDB)."
+    echo "  Fix manually if needed: apt-get install mariadb-client"
+    echo "  Or skip apt entirely: CLP_SYNC_SKIP_APT=1 ./bin/install.sh"
+    missing+=("mysqldump")
   fi
-  c_ok "Master tools ready (no CloudPanel changes)"
+  if ((${#need[@]})); then
+    safe_apt_install "${need[@]}" || missing+=("${need[@]}")
+  fi
+  if ((${#missing[@]})); then
+    c_err "Missing on master: ${missing[*]}"
+    return 1
+  fi
+  c_ok "Master tools ready (no MySQL/MariaDB packages touched)"
 }
 
 ensure_packages_standby() {
-  c_info "Checking packages on standby"
-  local need=()
-  for p in rsync sqlite3 openssl openssh-server python3; do
-    command -v "${p%% *}" >/dev/null 2>&1 || need+=("${p}")
+  c_info "Checking packages on standby (CLI tools only — no CloudPanel stack changes)"
+  local need=() missing=()
+  for p in rsync sqlite3 openssl python3; do
+    command -v "${p}" >/dev/null 2>&1 || need+=("${p}")
   done
-  # openssh-server package name vs sshd binary
   if ! command -v sshd >/dev/null 2>&1 && ! systemctl is-active ssh >/dev/null 2>&1 && ! systemctl is-active sshd >/dev/null 2>&1; then
     need+=("openssh-server")
   fi
   if ((${#need[@]})); then
-    apt-get update -y
-    apt-get install -y rsync sqlite3 openssl openssh-server python3 || true
+    safe_apt_install "${need[@]}" || missing+=("${need[@]}")
+  fi
+  if ((${#missing[@]})); then
+    c_warn "Some packages missing on standby: ${missing[*]}"
   fi
   systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || true
-  c_ok "Standby receiver tools ready"
+  c_ok "Standby receiver tools checked"
 }
 
 generate_pair_token() {
