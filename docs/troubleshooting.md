@@ -33,6 +33,19 @@ CLP_SYNC_SKIP_APT=1 ./bin/install.sh
 
 ## Install / pairing
 
+### `syntax error near unexpected token '('` during bootstrap
+
+SSH was sending `clpctl site:add:php` unquoted. A vhost template with a space or `(` (for example `Laravel 11`) was parsed as shell on the standby.
+
+**Master CloudPanel is unchanged.** Update the agent and re-run bootstrap (writes to standby only):
+
+```bash
+curl -fsSL https://github.com/supermaribo/cloudpanel-replication/archive/refs/heads/main.tar.gz | sudo tar xz -C /opt/clp-sync --strip-components=1
+sudo /opt/clp-sync/bin/clp-bootstrap
+```
+
+---
+
 ### Stuck looping on “Choose 1 or 2”
 
 `curl | sudo bash` feeds the script on stdin, so the installer could not read the keyboard and treated every empty Enter as “try again”.

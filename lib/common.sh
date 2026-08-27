@@ -76,22 +76,37 @@ load_config() {
   chmod 700 "${CLP_SYNC_STATE_DIR}" "${CLP_SYNC_TMP_DIR}"
 }
 
-ssh_base_opts() {
-  local opts=(-p "${STANDBY_SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+ssh_opts() {
+  SSH_OPTS=(-p "${STANDBY_SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
   if [[ -n "${STANDBY_SSH_KEY:-}" ]]; then
-    opts+=(-i "${STANDBY_SSH_KEY}")
+    SSH_OPTS+=(-i "${STANDBY_SSH_KEY}")
   fi
-  printf '%s\n' "${opts[@]}"
 }
 
 standby_target() {
   echo "${STANDBY_SSH_USER}@${STANDBY_HOST}"
 }
 
+# Quote one argument for the remote bash -c string (spaces, (), $, quotes).
+ssh_quote() {
+  printf '%q' "$1"
+}
+
+# Run a command on the standby.
+# One argument  = remote shell snippet (may contain &&, quotes, redirects).
+# Several args  = argv (each token is quoted so spaces/() in vhost templates
+#                 and passwords cannot break the remote shell).
 remote() {
-  # shellcheck disable=SC2207
-  local opts=($(ssh_base_opts))
-  ssh "${opts[@]}" "$(standby_target)" "$@"
+  local SSH_OPTS remote_cmd="" arg
+  ssh_opts
+  if [[ $# -eq 1 ]]; then
+    ssh "${SSH_OPTS[@]}" "$(standby_target)" "$1"
+    return
+  fi
+  for arg in "$@"; do
+    remote_cmd+="$(ssh_quote "${arg}") "
+  done
+  ssh "${SSH_OPTS[@]}" "$(standby_target)" "${remote_cmd}"
 }
 
 remote_bash() {

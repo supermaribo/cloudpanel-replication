@@ -29,18 +29,40 @@ bootstrap_site_on_standby() {
     log_warn "Linux user ${site_user} exists on standby but site ${domain} missing in panel — create site in UI or clean up user"
   fi
 
-  log_info "Creating ${site_type} site on standby: ${domain} (user=${site_user})"
+  # Ignore panel password hashes (bcrypt etc.) — clpctl needs a plaintext password.
+  if [[ "${password}" == \$* ]]; then
+    password="$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)"
+    log_warn "Panel DB has a hash for ${site_user}; using a temporary password (shadow sync will match login)"
+  fi
+
+  vhost_template="${vhost_template//$'\r'/}"
+  vhost_template="${vhost_template#"${vhost_template%%[![:space:]]*}"}"
+  vhost_template="${vhost_template%"${vhost_template##*[![:space:]]}"}"
+
+  log_info "Creating ${site_type} site on standby: ${domain} (user=${site_user} template=${vhost_template:-Generic})"
 
   case "${site_type}" in
     php)
       [[ -n "${php_version}" ]] || php_version="8.3"
       [[ -n "${vhost_template}" ]] || vhost_template="Generic"
-      remote clpctl site:add:php \
+      if ! remote clpctl site:add:php \
         --domainName="${domain}" \
         --phpVersion="${php_version}" \
         --vhostTemplate="${vhost_template}" \
         --siteUser="${site_user}" \
-        --siteUserPassword="${password}"
+        --siteUserPassword="${password}"; then
+        if [[ "${vhost_template}" != "Generic" ]]; then
+          log_warn "site:add:php failed with template '${vhost_template}'; retrying Generic"
+          remote clpctl site:add:php \
+            --domainName="${domain}" \
+            --phpVersion="${php_version}" \
+            --vhostTemplate="Generic" \
+            --siteUser="${site_user}" \
+            --siteUserPassword="${password}"
+        else
+          return 1
+        fi
+      fi
       ;;
     nodejs)
       remote clpctl site:add:nodejs \

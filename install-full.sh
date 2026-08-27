@@ -61,8 +61,12 @@ fi
 ok "CloudPanel detected"
 
 # --- Fetch source (git or tarball — no apt) ---------------------------------
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${ROOT}/lib/install-common.sh" ]]; then
+# curl | bash leaves BASH_SOURCE unset (set -u would abort on [0]).
+ROOT=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]:-}" ]]; then
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || ROOT=""
+fi
+if [[ -n "${ROOT}" && -f "${ROOT}/lib/install-common.sh" ]]; then
   # shellcheck source=lib/install-common.sh
   source "${ROOT}/lib/install-common.sh"
   # shellcheck source=lib/master-readonly.sh
