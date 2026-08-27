@@ -8,7 +8,7 @@ _panel_has_database() {
 
 bootstrap_site_on_standby() {
   local domain="$1" site_user="$2" site_type="$3" php_version="$4" vhost_template="${5:-Generic}"
-  local password exists
+  local password exists add_rc=0
 
   domain="${domain//$'\r'/}"
   site_user="${site_user//$'\r'/}"
@@ -36,23 +36,33 @@ bootstrap_site_on_standby() {
   [[ -n "${php_version}" ]] || php_version="8.3"
   vhost_template="Generic"
 
-  # Earlier rsync can create /home/<user> before CloudPanel runs useradd -m, which then fails.
-  local home_stashed=0 add_rc=0
-  if remote bash -s -- "${site_user}" <<'EOS'
-set -euo pipefail
+  # Failed prior runs can leave a Linux user and/or /home/<user> without a panel
+  # site. CloudPanel then errors: "siteUser: This value already exists."
+  log_info "Clearing orphan Linux user/home for ${site_user} on standby (panel has no site yet)"
+  remote bash -s -- "${site_user}" <<'EOS'
+set -u
 u="$1"
-id -u "$u" >/dev/null 2>&1 && exit 1
-[[ -d "/home/${u}" ]] || exit 1
+case "$u" in
+  ""|root|clp|mysql|www-data|nginx|nobody|daemon) echo "refusing to modify protected user $u" >&2; exit 2 ;;
+esac
 mkdir -p /var/tmp/clp-sync-prehome
-rm -rf "/var/tmp/clp-sync-prehome/${u}"
-mv "/home/${u}" "/var/tmp/clp-sync-prehome/${u}"
+if [[ -d "/home/${u}" ]]; then
+  rm -rf "/var/tmp/clp-sync-prehome/${u}"
+  mv "/home/${u}" "/var/tmp/clp-sync-prehome/${u}"
+fi
+if id -u "$u" >/dev/null 2>&1; then
+  pkill -KILL -u "$u" 2>/dev/null || true
+  userdel -f "$u" 2>/dev/null || userdel "$u" 2>/dev/null || true
+fi
+if getent group "$u" >/dev/null 2>&1; then
+  groupdel "$u" 2>/dev/null || true
+fi
+if [[ -d "/home/${u}" ]]; then
+  rm -rf "/var/tmp/clp-sync-prehome/${u}"
+  mv "/home/${u}" "/var/tmp/clp-sync-prehome/${u}"
+fi
+exit 0
 EOS
-  then
-    home_stashed=1
-    log_info "Moved existing /home/${site_user} aside so CloudPanel can create the user"
-  elif remote "id -u $(printf '%q' "${site_user}") >/dev/null 2>&1"; then
-    log_warn "Linux user ${site_user} exists on standby but site ${domain} missing in panel"
-  fi
 
   log_info "Creating ${site_type} site on standby: ${domain} (user=${site_user})"
 
@@ -108,9 +118,8 @@ EOS
   esac
   set -e
 
-  if [[ "${home_stashed}" -eq 1 ]]; then
-    remote bash -s -- "${site_user}" <<'EOS'
-set -euo pipefail
+  remote bash -s -- "${site_user}" <<'EOS'
+set -u
 u="$1"
 pre="/var/tmp/clp-sync-prehome/${u}"
 home="/home/${u}"
@@ -123,7 +132,6 @@ if [[ -d "${pre}" ]]; then
   rm -rf "${pre}"
 fi
 EOS
-  fi
 
   if [[ "${add_rc}" -ne 0 ]]; then
     log_error "clpctl site:add failed for ${domain} (exit ${add_rc})"
