@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dump MySQL databases on primary; import on standby only when dump changed.
+# Dump MySQL databases on primary; import on standby only when the database changed.
 
 _mysql_should_skip() {
   local name="$1"
@@ -14,12 +14,14 @@ sync_mysql() {
   rsync_ssh="$(rsync_ssh_cmd)"
 
   mkdir -p "${dump_dir}" "${checksum_dir}"
-  require_cmds mysqldump gzip sha256sum
+  require_cmds mysqldump gzip sha256sum clpctl
+
+  ensure_mysql_defaults || true
 
   local site_id domain site_user db_name db_user
-  local dump_file checksum_file old_sum new_sum remote_tmp
+  local dump_file checksum_file old_sum new_sum remote_tmp fp old_fp
 
-  log_info "Syncing MySQL databases"
+  log_info "Syncing MySQL databases (dump/import only if data changed)"
   while IFS='|' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     if _mysql_should_skip "${db_name}"; then
@@ -30,17 +32,27 @@ sync_mysql() {
     checksum_file="${checksum_dir}/${db_name}.sha256"
     remote_tmp="/var/tmp/clp-sync-import/${db_name}.sql.gz"
 
+    if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" ]] && incremental_on; then
+      fp="$(mysql_db_fingerprint "${db_name}" || true)"
+      old_fp="$(load_checksum "mysql-fp-${db_name}")"
+      if [[ -n "${fp}" && -n "${old_fp}" && "${fp}" == "${old_fp}" ]]; then
+        log_info "Unchanged ${db_name} (skip dump and import)"
+        INC_MYSQL_SKIP=$((INC_MYSQL_SKIP + 1))
+        continue
+      fi
+    fi
+
     log_info "Dumping ${db_name}"
-    mysqldump --single-transaction --quick --routines --triggers \
-      --default-character-set=utf8mb4 \
-      "${db_name}" | gzip -c >"${dump_file}"
+    dump_database "${db_name}" "${dump_file}"
 
     new_sum="$(sha256_file "${dump_file}")"
     old_sum=""
     [[ -f "${checksum_file}" ]] && old_sum="$(cat "${checksum_file}")"
 
     if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" && "${new_sum}" == "${old_sum}" ]]; then
-      log_info "Unchanged ${db_name} (skip import)"
+      log_info "Unchanged dump ${db_name} (skip import)"
+      [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
+      INC_MYSQL_SKIP=$((INC_MYSQL_SKIP + 1))
       continue
     fi
 
@@ -50,7 +62,9 @@ sync_mysql() {
 
     if remote clpctl db:import --databaseName="${db_name}" --file="${remote_tmp}"; then
       echo "${new_sum}" >"${checksum_file}"
+      [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
       remote "rm -f '${remote_tmp}'"
+      INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
       log_ok "Imported ${db_name}"
     else
       log_error "Import failed for ${db_name}"
@@ -79,7 +93,9 @@ reconcile_db_passwords() {
     if ! password="$(guess_db_password "${site_user}" "${domain}" "${db_name}")"; then
       continue
     fi
-    # Escape single quotes for SQL string literals
+    if checksum_eq "mysql-user-${db_user}" "$(str_digest "${password}")"; then
+      continue
+    fi
     local sql_pass
     sql_pass="$(printf '%s' "${password}" | sed "s/'/''/g")"
     printf "ALTER USER '%s'@'localhost' IDENTIFIED BY '%s';\nFLUSH PRIVILEGES;\n" \
@@ -87,7 +103,8 @@ reconcile_db_passwords() {
     chmod 600 "${sql_file}"
     remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
     rsync -a -e "${rsync_ssh}" "${sql_file}" "$(standby_target):${remote_sql}"
-    if remote "mysql < '${remote_sql}' && rm -f '${remote_sql}'"; then
+    if remote_mysql_file "${remote_sql}" && remote "rm -f '${remote_sql}'"; then
+      save_checksum "mysql-user-${db_user}" "$(str_digest "${password}")"
       log_info "Aligned password for MySQL user ${db_user}"
     else
       log_warn "Could not ALTER USER ${db_user} on standby"

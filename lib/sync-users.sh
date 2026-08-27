@@ -116,6 +116,10 @@ getent group ftp-user >/dev/null 2>&1 || groupadd ftp-user || true
 while IFS=$'\t' read -r ftp_user home site_user; do
   [[ -n "$ftp_user" ]] || continue
   if ! id -u "$ftp_user" >/dev/null 2>&1; then
+    if [[ -n "$site_user" ]] && ! id -u "$site_user" >/dev/null 2>&1; then
+      echo "skip ftp $ftp_user — parent site user $site_user missing (bootstrap first)" >&2
+      continue
+    fi
     adduser --disabled-password --gecos "" --home "$home" "$ftp_user" || true
   fi
   mkdir -p "$home"

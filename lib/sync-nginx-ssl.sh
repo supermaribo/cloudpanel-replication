@@ -1,42 +1,37 @@
 #!/usr/bin/env bash
-# Full SSL / Let's Encrypt certificate mirror + PHP-FPM pools + nginx site config.
+# SSL / Let's Encrypt / PHP-FPM / nginx — rsync deltas; reload only when files changed.
 
 sync_nginx_ssl() {
-  local rsync_ssh
-  rsync_ssh="$(rsync_ssh_cmd)"
   local changed=0
 
-  log_info "Syncing nginx site configs (full mirror)"
+  log_info "Syncing nginx / SSL configs (changed files only)"
 
   for dir in sites-enabled sites-available ssl-certificates conf.d modules-enabled cloudflare; do
     if [[ -e "/etc/nginx/${dir}" ]]; then
-      log_info "rsync /etc/nginx/${dir}"
-      rsync -a --delete -e "${rsync_ssh}" \
-        "/etc/nginx/${dir}" \
-        "$(standby_target):/etc/nginx/"
-      changed=1
+      rsync_to_standby "/etc/nginx/${dir}" /etc/nginx/
+      [[ "${RSYNC_CHANGED}" -eq 1 ]] && changed=1
     fi
   done
 
-  # ACME / certbot state if present (some installs / custom tooling)
   for dir in /etc/letsencrypt /var/lib/letsencrypt; do
     if [[ -d "${dir}" ]]; then
-      log_info "rsync ${dir}"
       remote "mkdir -p '${dir}'"
-      rsync -a --delete -e "${rsync_ssh}" "${dir}/" "$(standby_target):${dir}/"
-      changed=1
+      rsync_to_standby "${dir}/" "${dir}/"
+      [[ "${RSYNC_CHANGED}" -eq 1 ]] && changed=1
     fi
   done
 
-  # CloudPanel ACME / SSL helpers under panel home (if present)
   for path in /home/clp/.acme.sh /home/clp/acme /home/clp/etc/ssl; do
     if [[ -e "${path}" ]]; then
-      log_info "rsync ${path}"
       remote "mkdir -p '$(dirname "${path}")'"
-      rsync -a -e "${rsync_ssh}" "${path}" "$(standby_target):$(dirname "${path}")/"
-      changed=1
+      rsync_to_standby "${path}" "$(dirname "${path}")/"
+      [[ "${RSYNC_CHANGED}" -eq 1 ]] && changed=1
     fi
   done
+
+  if [[ "${changed}" -eq 1 ]]; then
+    INC_CFG_CHANGES=$((INC_CFG_CHANGES + 1))
+  fi
 
   if [[ "${RELOAD_NGINX_ON_STANDBY}" == "1" && "${changed}" -eq 1 ]]; then
     log_info "Testing and reloading nginx on standby"
@@ -45,25 +40,24 @@ sync_nginx_ssl() {
     else
       log_warn "Nginx reload on standby failed — check configs manually"
     fi
+  elif [[ "${changed}" -eq 0 ]]; then
+    log_info "Nginx/SSL unchanged — skip reload"
   fi
 }
 
-# Mirror PHP-FPM pool configs so nginx upstream ports match the primary.
 sync_php_fpm_pools() {
-  local rsync_ssh
-  rsync_ssh="$(rsync_ssh_cmd)"
   local any=0
+  local changed=0
   local pool_dir
 
-  log_info "Syncing PHP-FPM pool configs"
+  log_info "Syncing PHP-FPM pool configs (changed files only)"
   shopt -s nullglob
   for pool_dir in /etc/php/*/fpm/pool.d; do
     [[ -d "${pool_dir}" ]] || continue
     any=1
     remote "mkdir -p '${pool_dir}'"
-    rsync -a --delete -e "${rsync_ssh}" \
-      "${pool_dir}/" \
-      "$(standby_target):${pool_dir}/"
+    rsync_to_standby "${pool_dir}/" "${pool_dir}/"
+    [[ "${RSYNC_CHANGED}" -eq 1 ]] && changed=1
   done
   shopt -u nullglob
 
@@ -72,11 +66,16 @@ sync_php_fpm_pools() {
     return 0
   fi
 
+  if [[ "${changed}" -eq 0 ]]; then
+    log_info "PHP-FPM pools unchanged — skip reload"
+    return 0
+  fi
+
+  INC_CFG_CHANGES=$((INC_CFG_CHANGES + 1))
   remote 'for s in php*-fpm php*-fpm.service; do systemctl reload "$s" 2>/dev/null || systemctl restart "$s" 2>/dev/null || true; done; true'
-  log_ok "PHP-FPM pools mirrored and reloaded"
+  log_ok "PHP-FPM pools updated and reloaded"
 }
 
-# Rewrite /etc/cron.d/<siteUser> on standby from primary inventory.
 sync_crons() {
   local db_snap="$1"
   local cron_tmp="${CLP_SYNC_TMP_DIR}/crons"
@@ -104,7 +103,6 @@ sync_crons() {
     echo "${minute} ${hour} ${day} ${month} ${weekday} ${site_user} ${command}" >>"${cron_file}"
   done < <(inventory_crons "${db_snap}")
 
-  # Also copy any primary /etc/cron.d files named after site users (belt and suspenders)
   while IFS= read -r site_user; do
     [[ -n "${site_user}" ]] || continue
     if [[ -f "/etc/cron.d/${site_user}" && ! -f "${cron_tmp}/${site_user}" ]]; then
@@ -117,6 +115,14 @@ sync_crons() {
     return 0
   fi
 
+  local digest
+  digest="$(cat "${cron_tmp}"/* | sha256sum | awk '{print $1}')"
+  if checksum_eq crons "${digest}"; then
+    log_info "Cron files unchanged — skip"
+    INC_SKIPPED=$((INC_SKIPPED + 1))
+    return 0
+  fi
+
   log_info "Syncing site cron.d files to standby"
   for cron_file in "${cron_tmp}"/*; do
     local base
@@ -124,5 +130,7 @@ sync_crons() {
     chmod 644 "${cron_file}"
     rsync -a -e "${rsync_ssh}" "${cron_file}" "$(standby_target):/etc/cron.d/${base}"
   done
+  save_checksum crons "${digest}"
+  INC_CFG_CHANGES=$((INC_CFG_CHANGES + 1))
   log_ok "Cron sync complete"
 }

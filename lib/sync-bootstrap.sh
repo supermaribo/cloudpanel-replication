@@ -38,6 +38,11 @@ bootstrap_site_on_standby() {
   vhost_template="${vhost_template//$'\r'/}"
   vhost_template="${vhost_template#"${vhost_template%%[![:space:]]*}"}"
   vhost_template="${vhost_template%"${vhost_template##*[![:space:]]}"}"
+  # Custom nginx stored in the panel DB is not a clpctl template name.
+  if [[ -z "${vhost_template}" || "${vhost_template}" == "#"* || "${vhost_template}" == *$'\n'* \
+     || "${vhost_template}" == *"server {"* || "${#vhost_template}" -gt 80 ]]; then
+    vhost_template="Generic"
+  fi
 
   log_info "Creating ${site_type} site on standby: ${domain} (user=${site_user} template=${vhost_template:-Generic})"
 

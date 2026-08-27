@@ -53,6 +53,7 @@ load_config() {
   : "${CLP_SYNC_LOG_DIR:=/var/log/clp-sync}"
   : "${RSYNC_EXCLUDES_FILE:=${CLP_SYNC_ROOT}/excludes/rsync-excludes.txt}"
   : "${BOOTSTRAP_SITE_TYPES:=php,nodejs,python,static,reverse-proxy}"
+  : "${INCREMENTAL:=1}"
   : "${MYSQL_SKIP_UNCHANGED:=1}"
   : "${MYSQL_SKIP_DATABASES:=information_schema,performance_schema,sys,mysql}"
   : "${RELOAD_NGINX_ON_STANDBY:=1}"
@@ -166,3 +167,8 @@ write_status() {
   } >"${f}"
   chmod 600 "${f}"
 }
+
+# shellcheck source=mysql-auth.sh
+source "${CLP_SYNC_ROOT}/lib/mysql-auth.sh"
+# shellcheck source=incremental.sh
+source "${CLP_SYNC_ROOT}/lib/incremental.sh"

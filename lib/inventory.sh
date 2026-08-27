@@ -15,17 +15,27 @@ inventory_snapshot() {
 
 # Print pipe-separated sites:
 # id|domain_name|user|type|php_version|vhost_template|user_password
+# vhost_template in SQLite is often the FULL nginx config (newlines). Never emit that —
+# it would split this loop and skip remaining sites. Custom vhosts are copied via rsync.
 inventory_sites() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
   sqlite3 -separator '|' "${db}" "
 SELECT
   s.id,
-  s.domain_name,
-  s.user,
-  s.type,
+  replace(replace(s.domain_name, char(10), ''), char(13), ''),
+  replace(replace(s.user, char(10), ''), char(13), ''),
+  replace(replace(s.type, char(10), ''), char(13), ''),
   COALESCE(p.php_version, ''),
-  COALESCE(s.vhost_template, 'Generic'),
-  COALESCE(s.user_password, '')
+  CASE
+    WHEN s.vhost_template IS NULL OR trim(s.vhost_template) = '' THEN 'Generic'
+    WHEN instr(s.vhost_template, char(10)) > 0 THEN 'Generic'
+    WHEN s.vhost_template LIKE '#%' THEN 'Generic'
+    WHEN s.vhost_template LIKE '%server {%' THEN 'Generic'
+    WHEN s.vhost_template LIKE '%listen %' THEN 'Generic'
+    WHEN length(s.vhost_template) > 80 THEN 'Generic'
+    ELSE trim(s.vhost_template)
+  END,
+  ''
 FROM site s
 LEFT JOIN php_settings p ON p.site_id = s.id
 ORDER BY s.domain_name;
@@ -101,8 +111,9 @@ guess_db_password() {
   local root="/home/${site_user}/htdocs/${domain}"
   local f pass
 
-  for f in "${root}/.env" "${root}/wp-config.php" "${root}/public/wp-config.php" \
-           "${root}/app/.env" "${root}/htdocs/.env"; do
+  for f in "${root}/.env" "${root}/.env.local" "${root}/app/.env" "${root}/htdocs/.env" \
+           "${root}/public/../.env" \
+           "${root}/wp-config.php" "${root}/public/wp-config.php"; do
     [[ -f "${f}" ]] || continue
     if [[ "${f}" == *wp-config.php ]]; then
       pass="$(grep -E "define\(\s*['\"]DB_PASSWORD['\"]" "${f}" 2>/dev/null \

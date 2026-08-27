@@ -33,6 +33,25 @@ CLP_SYNC_SKIP_APT=1 ./bin/install.sh
 
 ## Install / pairing
 
+### `mysqldump: Access denied for user 'root'@'localhost' (using password: NO)`
+
+CloudPanel MySQL root is usually `root@127.0.0.1` with a password from `clpctl db:show:master-credentials`. Socket `root@localhost` has no password and is denied.
+
+The sync now authenticates with those credentials, or falls back to read-only `clpctl db:export`.
+
+Update `/opt/clp-sync` and re-run:
+
+```bash
+curl -fsSL https://github.com/supermaribo/cloudpanel-replication/archive/refs/heads/main.tar.gz | sudo tar xz -C /opt/clp-sync --strip-components=1
+sudo /opt/clp-sync/bin/clp-bootstrap
+```
+
+### Vhost template “does not exist” / only one site bootstrapped
+
+CloudPanel stores the **full nginx vhost** in SQLite. That used to break the site list (newlines) so later sites were skipped. Bootstrap now uses template `Generic`, then rsync copies the real vhost from `/etc/nginx`.
+
+---
+
 ### `syntax error near unexpected token '('` during bootstrap
 
 SSH was sending `clpctl site:add:php` unquoted. A vhost template with a space or `(` (for example `Laravel 11`) was parsed as shell on the standby.

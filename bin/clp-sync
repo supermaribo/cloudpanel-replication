@@ -97,7 +97,7 @@ START_TS="$(date +%s)"
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
 
 require_cmds ssh rsync sqlite3 flock openssl
-log_info "clp-sync starting (full mirror) → ${STANDBY_HOST}"
+log_info "clp-sync starting (incremental) → ${STANDBY_HOST}"
 
 if [[ "${SKIP_CHECKS}" -eq 0 ]]; then
   log_info "Running pre-sync compatibility checks"
@@ -154,6 +154,7 @@ sync_panel_meta "${DB_SNAP}"
 
 DURATION="$(( $(date +%s) - START_TS ))"
 write_status ok "duration_s=${DURATION}"
-log_ok "clp-sync finished (identical mirror) in ${DURATION}s"
+log_incremental_summary
+log_ok "clp-sync finished (incremental) in ${DURATION}s"
 trap - EXIT
 exit 0
