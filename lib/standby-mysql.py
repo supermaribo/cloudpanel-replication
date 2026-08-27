@@ -510,6 +510,9 @@ def try_extra_cnfs():
     ):
         if not os.path.isfile(path) or not looks_like_cnf(path):
             continue
+        # Last run saved a TCP root that can SELECT 1 but cannot CREATE DATABASE.
+        if path == PERSIST_CNF and not cnf_is_socket(path):
+            continue
         cmd = mysql_cmd(path)
         print(f"standby-mysql: trying {path}", flush=True)
         if probe(cmd):
@@ -522,63 +525,42 @@ def build_client():
     assert_standby()
     rescue_mysql()
 
+    # Unix socket root is the CloudPanel admin account. Use it for CREATE + import.
+    # Do not switch to TCP root@127.0.0.1 — that user can log in with no CREATE.
+    sock_cmd = socket_root_cmd()
+    if sock_cmd:
+        print("standby-mysql: import client=socket-root", flush=True)
+        return sock_cmd, [], None
+
     extra, temps = try_extra_cnfs()
     if extra:
         return extra, temps, None
-
-    sock_cmd = socket_root_cmd()
-    if sock_cmd:
-        try:
-            user, password, port = parse_clpctl()
-            if align_tcp_root(sock_cmd, user, password):
-                cnf = write_cnf(user, password, "127.0.0.1", port)
-                tcp = mysql_cmd(cnf)
-                if probe(tcp, secret=password):
-                    print("standby-mysql: auth=cloudpanel-tcp after socket align", flush=True)
-                    persist_cnf(user, password, port)
-                    return tcp, [cnf], None
-                temps = [cnf]
-            else:
-                temps = []
-        except Exception as e:
-            print(f"standby-mysql: tcp align skipped: {e}", flush=True)
-            temps = []
-        print("standby-mysql: importing via socket root (no systemd mysql restart)", flush=True)
-        return sock_cmd, temps, None
 
     user, password, port = parse_clpctl()
     cnf = write_cnf(user, password, "127.0.0.1", port)
     temps = [cnf]
     tcp = mysql_cmd(cnf)
 
-    if probe(tcp, secret=password):
-        print("standby-mysql: auth=cloudpanel-tcp", flush=True)
-        persist_cnf(user, password, port)
-        return tcp, temps, None
-
-    print("standby-mysql: panel password does not match standby MySQL yet", flush=True)
+    print("standby-mysql: panel TCP root not used; socket root unavailable", flush=True)
     ensure_skip_name_resolve()
     sock_cmd = socket_root_cmd()
     if sock_cmd:
-        print("standby-mysql: importing via socket root", flush=True)
+        print("standby-mysql: import client=socket-root", flush=True)
         return sock_cmd, temps, None
-    if probe(tcp, secret=password):
-        print("standby-mysql: auth=cloudpanel-tcp after skip-name-resolve", flush=True)
-        persist_cnf(user, password, port)
-        return tcp, temps, None
 
     skip_grant_oneshot(user, password)
     sock_cmd = socket_root_cmd()
     if sock_cmd:
+        print("standby-mysql: import client=socket-root after skip-grant", flush=True)
         return sock_cmd, temps, None
-    if probe(tcp, secret=password):
-        print("standby-mysql: auth=cloudpanel-tcp after oneshot skip-grant", flush=True)
-        persist_cnf(user, password, port)
-        return tcp, temps, None
 
     extra, _ = try_extra_cnfs()
     if extra:
         return extra, temps, None
+
+    if probe(tcp, secret=password):
+        print("standby-mysql: falling back to TCP root (may lack CREATE)", flush=True)
+        return tcp, temps, None
 
     sys.exit(
         "standby mysql import auth failed. Master was not changed. "
