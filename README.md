@@ -8,24 +8,35 @@ One-way **identical mirror** from a live CloudPanel **master** to a **hot standb
 
 ## Install in one command
 
-**Standby first**, then **master**:
+**Standby first**, then **master**. Set the role in the command so you never get stuck on “press 1 or 2”:
 
 **Master:** read-only — **zero** `apt-get`, **zero** `clpctl`, **zero** changes to nginx/MySQL/sites. See [master read-only policy](docs/master-readonly.md).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+# Standby (empty CloudPanel) — run FIRST
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+
+# Master (live CloudPanel) — run AFTER the standby listener is waiting
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
 ```
 
-| Server | Choose at prompt |
-|--------|------------------|
-| Standby (new CloudPanel) | `2` — save pairing token, leave listener running |
-| Master (live CloudPanel) | `1` — enter standby host + token, bootstrap + timer |
+If prompts still fail, download then run (uses a real terminal):
 
-Alternative:
+```bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh -o /tmp/clp-install.sh
+sudo bash /tmp/clp-install.sh
+```
+
+| Server | Role |
+|--------|------|
+| Standby (new CloudPanel) | `CLP_SYNC_ROLE=standby` — save pairing token, leave listener running |
+| Master (live CloudPanel) | `CLP_SYNC_ROLE=master` — enter standby host + token, bootstrap + timer |
+
+Alternative (git clone):
 
 ```bash
 git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
-cd /root/clp-sync-src && sudo ./install-full.sh
+cd /root/clp-sync-src && sudo CLP_SYNC_ROLE=standby ./install-full.sh
 ```
 
 **Prerequisites:** Ubuntu, CloudPanel on both servers, Tailscale on same tailnet.

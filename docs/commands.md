@@ -11,11 +11,14 @@ All scripts installed to `/opt/clp-sync/bin/` (or run from git clone at `./bin/`
 Clone/update repo and start interactive installer.
 
 ```bash
-# One-liner from GitHub
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+# Standby first
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+
+# Master second
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
 
 # From clone
-sudo ./install-full.sh
+sudo CLP_SYNC_ROLE=standby ./install-full.sh
 ```
 
 Environment overrides:
@@ -25,6 +28,7 @@ Environment overrides:
 | `CLP_SYNC_REPO` | `https://github.com/supermaribo/cloudpanel-replication.git` |
 | `CLP_SYNC_INSTALL_DIR` | `/root/clp-sync-src` |
 | `CLP_SYNC_BRANCH` | `main` |
+| `CLP_SYNC_ROLE` | *(prompt 1 or 2)* — set `standby` or `master` |
 
 ---
 

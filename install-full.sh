@@ -3,10 +3,12 @@
 #
 # NEVER runs apt-get. Safe on production CloudPanel master.
 #
-# One-liner (standby OR master):
-#   curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+# One-liner (standby first, then master). Set the role so curl|bash cannot loop on 1/2:
+#   curl -fsSL .../install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+#   curl -fsSL .../install-full.sh | sudo CLP_SYNC_ROLE=master bash
 #
-# Install order: STANDBY (2) first, then MASTER (1).
+# Safer (real terminal stdin):
+#   curl -fsSL .../install-full.sh -o /tmp/clp-install.sh && sudo bash /tmp/clp-install.sh
 set -euo pipefail
 
 REPO_URL="${CLP_SYNC_REPO:-https://github.com/supermaribo/cloudpanel-replication.git}"
@@ -85,10 +87,15 @@ echo
 info "Starting interactive installer..."
 echo
 echo "  ┌─────────────────────────────────────────────────────────┐"
-echo "  │  STANDBY (new server)  →  type 2   (run FIRST)          │"
-echo "  │  MASTER (live sites)   →  type 1   (run AFTER standby)  │"
+echo "  │  STANDBY (new server)  →  CLP_SYNC_ROLE=standby (or 2)  │"
+echo "  │  MASTER (live sites)   →  CLP_SYNC_ROLE=master  (or 1)  │"
 echo "  │  Master: NO apt, NO CloudPanel changes — read-only sync  │"
 echo "  └─────────────────────────────────────────────────────────┘"
 echo
 
-exec "${INSTALL_DIR}/bin/install.sh"
+# Re-open the keyboard. curl | bash leaves stdin at EOF, which used to loop on 1/2.
+if [[ -r /dev/tty ]]; then
+  exec "${INSTALL_DIR}/bin/install.sh" "$@" </dev/tty
+else
+  exec "${INSTALL_DIR}/bin/install.sh" "$@"
+fi

@@ -33,6 +33,24 @@ CLP_SYNC_SKIP_APT=1 ./bin/install.sh
 
 ## Install / pairing
 
+### Stuck looping on “Choose 1 or 2”
+
+`curl | sudo bash` feeds the script on stdin, so the installer could not read the keyboard and treated every empty Enter as “try again”.
+
+**Stop:** Ctrl+C
+
+**Standby — use this instead:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+```
+
+Or, if `/root/clp-sync-src` already exists:
+
+```bash
+sudo CLP_SYNC_ROLE=standby /root/clp-sync-src/bin/install.sh
+```
+
 ### `Tailscale not connected`
 
 ```bash

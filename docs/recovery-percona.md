@@ -88,10 +88,8 @@ systemctl status nginx cloudpanel-nginx clp-nginx 2>/dev/null || systemctl statu
 **Only after MySQL is running again:**
 
 ```bash
-CLP_SYNC_SKIP_APT=1 curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
 ```
-
-When prompted, type **`2`** for Standby (do not choose 1).
 
 ---
 

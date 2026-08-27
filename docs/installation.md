@@ -61,22 +61,21 @@ tailscale status
 ### Step 1 — Standby **first**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
 ```
 
 What `install-full.sh` does:
 
-1. Checks root, Tailscale, CloudPanel
-2. Installs `git` / `curl` if missing
-3. Clones repo to `/root/clp-sync-src`
-4. Runs interactive `bin/install.sh`
+1. Checks root, Tailscale, CloudPanel (**never** runs `apt-get`)
+2. Downloads the repo to `/root/clp-sync-src` (git or tarball)
+3. Runs interactive `bin/install.sh` with the keyboard attached
+
+**Do not** use `curl | sudo bash` without `CLP_SYNC_ROLE=...` on a piped install — stdin is the pipe, so “press 1 or 2” used to loop forever.
 
 **Prompts:**
 
 | Prompt | Answer |
 |--------|--------|
-| Role | `2` (Standby) |
-| Compatibility checks | Automatic |
 | Start pairing listener? | `Y` |
 
 **Save:**
@@ -94,7 +93,7 @@ Leave the terminal open while the listener runs.
 On your **live** CloudPanel server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
 ```
 
 **Prompts:**
@@ -218,6 +217,7 @@ sudo rsync -a --exclude config.env ./ /opt/clp-sync/
 CLP_SYNC_REPO=https://github.com/supermaribo/cloudpanel-replication.git
 CLP_SYNC_INSTALL_DIR=/root/clp-sync-src
 CLP_SYNC_BRANCH=main
+CLP_SYNC_ROLE=standby   # or master — skips the 1/2 prompt
 
-curl -fsSL .../install-full.sh | sudo -E bash
+curl -fsSL .../install-full.sh | sudo CLP_SYNC_ROLE=standby bash
 ```

@@ -17,15 +17,16 @@ Five-minute install guide. **Standby first, then master.**
 SSH into the **standby** and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
 ```
 
 | Prompt | Answer |
 |--------|--------|
-| Role | `2` (Standby) |
 | Start pairing listener? | `Y` |
 
 **Save the pairing token** and leave the terminal open.
+
+Stuck on “Choose 1 or 2”? Press Ctrl+C, then use the command above (`CLP_SYNC_ROLE=standby`). The old one-liner (`curl | sudo bash`) could not read the keyboard.
 
 ---
 
@@ -34,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/
 SSH into the **master** and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
 ```
 
 | Prompt | Answer |

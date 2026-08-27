@@ -20,14 +20,56 @@ c_ok()    { printf '\033[1;32mOK\033[0m  %s\n' "$*"; }
 c_warn()  { printf '\033[1;33mWARN\033[0m %s\n' "$*"; }
 c_err()   { printf '\033[1;31mERR\033[0m  %s\n' "$*" >&2; }
 
+# curl | bash leaves stdin at EOF. Always read prompts from the keyboard.
+INSTALL_TTY=""
+ensure_install_tty() {
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    INSTALL_TTY=/dev/tty
+    return 0
+  fi
+  INSTALL_TTY=""
+  return 1
+}
+
+_prompt_read_fail() {
+  c_err "Cannot read from the keyboard (installer was run as curl | bash, or this is not a terminal)."
+  echo "  Press Ctrl+C if you are stuck in a prompt loop."
+  echo "  Then run one of:"
+  echo "    sudo CLP_SYNC_ROLE=standby /root/clp-sync-src/bin/install.sh"
+  echo "    sudo CLP_SYNC_ROLE=master  /root/clp-sync-src/bin/install.sh"
+  echo "  Or download first so prompts work:"
+  echo "    curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh -o /tmp/clp-install.sh"
+  echo "    sudo bash /tmp/clp-install.sh"
+  exit 1
+}
+
+_read_reply() {
+  local prompt="$1"
+  REPLY=""
+  if [[ -n "${INSTALL_TTY}" ]]; then
+    if ! read -r -p "${prompt}" REPLY <"${INSTALL_TTY}"; then
+      _prompt_read_fail
+    fi
+  elif [[ -t 0 ]]; then
+    if ! read -r -p "${prompt}" REPLY; then
+      _prompt_read_fail
+    fi
+  else
+    _prompt_read_fail
+  fi
+  REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
+  REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
+  REPLY="${REPLY//$'\r'/}"
+}
+
 ask() {
   # ask "Prompt" "default" → sets REPLY
   local prompt="$1" default="${2:-}"
   if [[ -n "${default}" ]]; then
-    read -r -p "${prompt} [${default}]: " REPLY || true
+    _read_reply "${prompt} [${default}]: "
     REPLY="${REPLY:-${default}}"
   else
-    read -r -p "${prompt}: " REPLY || true
+    _read_reply "${prompt}: "
   fi
 }
 
@@ -35,13 +77,21 @@ ask_yn() {
   # ask_yn "Prompt" "y|n" → returns 0 for yes
   local prompt="$1" default="${2:-y}" yn
   if [[ "${default}" == "y" ]]; then
-    read -r -p "${prompt} [Y/n]: " yn || true
-    yn="${yn:-y}"
+    _read_reply "${prompt} [Y/n]: "
+    yn="${REPLY:-y}"
   else
-    read -r -p "${prompt} [y/N]: " yn || true
-    yn="${yn:-n}"
+    _read_reply "${prompt} [y/N]: "
+    yn="${REPLY:-n}"
   fi
   [[ "${yn}" =~ ^[Yy] ]]
+}
+
+normalize_install_role() {
+  case "$1" in
+    1|m|M|master|Master) printf '%s\n' master ;;
+    2|s|S|standby|Standby|slave|Slave) printf '%s\n' standby ;;
+    *) printf '%s\n' "" ;;
+  esac
 }
 
 require_root_install() {

@@ -41,7 +41,11 @@ Complete guides for [CloudPanel Hot Standby Sync](../README.md).
 On **each** server (standby first, then master):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+# Standby first
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+
+# Master second
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
 ```
 
 ### Git clone

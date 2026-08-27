@@ -13,6 +13,30 @@ source "${ROOT}/lib/checks.sh"
 source "${ROOT}/lib/master-readonly.sh"
 
 require_root_install
+ensure_install_tty || true
+
+# --role / CLP_SYNC_ROLE skips the 1-or-2 prompt (needed for curl | bash).
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role)
+      CLP_SYNC_ROLE="${2:-}"
+      shift 2
+      ;;
+    --role=*)
+      CLP_SYNC_ROLE="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: install.sh [--role master|standby]"
+      echo "  Or set CLP_SYNC_ROLE=standby|master (1 or 2 also accepted)."
+      exit 0
+      ;;
+    *)
+      c_err "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
 
 echo
 echo "============================================"
@@ -44,26 +68,37 @@ else
   c_ok "CloudPanel detected"
 fi
 
-echo
-echo "What is this server?"
-echo "  1) Master  — live site (clone FROM here; no site changes)"
-echo "  2) Standby — mirror target (clone TO here)  ← new/empty CloudPanel"
-echo
-c_warn "New empty server? You MUST choose 2 (Standby). Do NOT press Enter for default."
-ask "Choose 1 or 2 (required)" ""
-ROLE_CHOICE="${REPLY}"
-
-while [[ -z "${ROLE_CHOICE}" ]]; do
-  c_err "You must type 1 or 2 — empty input not allowed"
-  ask "Choose 1 or 2" ""
-  ROLE_CHOICE="${REPLY}"
-done
-
-case "${ROLE_CHOICE}" in
-  1|m|M|master|Master) ROLE=master ;;
-  2|s|S|standby|Standby|slave|Slave) ROLE=standby ;;
-  *) c_err "Invalid choice"; exit 1 ;;
-esac
+ROLE=""
+if [[ -n "${CLP_SYNC_ROLE:-}" ]]; then
+  ROLE="$(normalize_install_role "${CLP_SYNC_ROLE}")"
+  if [[ -z "${ROLE}" ]]; then
+    c_err "Invalid CLP_SYNC_ROLE=${CLP_SYNC_ROLE} (use 1/master or 2/standby)"
+    exit 1
+  fi
+  c_ok "Role: ${ROLE} (from CLP_SYNC_ROLE / --role)"
+else
+  echo
+  echo "What is this server?"
+  echo "  1) Master  — live site (clone FROM here; no site changes)"
+  echo "  2) Standby — mirror target (clone TO here)  ← new/empty CloudPanel"
+  echo
+  c_warn "New empty server? Type 2. Do not press Enter."
+  echo "  Tip: skip this prompt next time with CLP_SYNC_ROLE=standby"
+  attempts=0
+  while [[ -z "${ROLE}" ]]; do
+    attempts=$((attempts + 1))
+    if ((attempts > 5)); then
+      c_err "No valid role after 5 tries. Stop with Ctrl+C if this is looping."
+      echo "  Then: sudo CLP_SYNC_ROLE=standby /root/clp-sync-src/bin/install.sh"
+      exit 1
+    fi
+    ask "Choose 1 or 2 (required)" ""
+    ROLE="$(normalize_install_role "${REPLY}")"
+    if [[ -z "${ROLE}" ]]; then
+      c_err "Type 1 (master) or 2 (standby) — empty input is not allowed"
+    fi
+  done
+fi
 
 install_files
 
@@ -242,6 +277,7 @@ echo "  Status:  /opt/clp-sync/bin/clp-failover-check 30"
 echo "  Logs:    journalctl -u clp-sync.service -f"
 echo "  Manual:  /opt/clp-sync/bin/clp-sync"
 echo "  Docs:    https://github.com/supermaribo/cloudpanel-replication/tree/main/docs"
-echo "  One-liner: curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash"
+echo "  Standby: curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash"
+echo "  Master:  curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash"
 echo "  Remove:  /opt/clp-sync/bin/uninstall.sh"
 echo
