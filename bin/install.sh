@@ -45,10 +45,17 @@ fi
 echo
 echo "What is this server?"
 echo "  1) Master  — live site (clone FROM here; no site changes)"
-echo "  2) Standby — mirror target (clone TO here)"
+echo "  2) Standby — mirror target (clone TO here)  ← new/empty CloudPanel"
 echo
-ask "Choose 1 or 2" "1"
+c_warn "New empty server? You MUST choose 2 (Standby). Do NOT press Enter for default."
+ask "Choose 1 or 2 (required)" ""
 ROLE_CHOICE="${REPLY}"
+
+while [[ -z "${ROLE_CHOICE}" ]]; do
+  c_err "You must type 1 or 2 — empty input not allowed"
+  ask "Choose 1 or 2" ""
+  ROLE_CHOICE="${REPLY}"
+done
 
 case "${ROLE_CHOICE}" in
   1|m|M|master|Master) ROLE=master ;;
