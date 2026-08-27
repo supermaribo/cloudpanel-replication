@@ -412,12 +412,11 @@ if not changed:
     print("no active backup jobs to disable")
 
 COL_RE = re.compile(
-    r"(remote[_ ]?backup|is_remote_backup|enable[_ ]?remote[_ ]?backup|"
-    r"remote[_ ]?backup[_ ]?enabled)",
+    r"(is_remote_backup|enable[_ ]?remote[_ ]?backup$|remote[_ ]?backup[_ ]?enabled)",
     re.I,
 )
 TABLE_RE = re.compile(r"backup|rclone", re.I)
-KV_KEY = re.compile(r"remote.?backup|enable.?remote|automatic.?backup", re.I)
+KV_KEY = re.compile(r"^remote_backup_enabled$", re.I)
 try:
     con = sqlite3.connect(sys.argv[1])
     tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]

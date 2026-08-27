@@ -21,8 +21,9 @@ sync_mysql() {
   local site_id domain site_user db_name db_user
   local dump_file checksum_file imported_stamp old_sum new_sum remote_tmp fp old_fp
 
-  log_info "Syncing MySQL databases (dump/import only if data changed)"
-  run_bootstrap_databases "${db_snap}" || true
+  log_info "Syncing MySQL databases (dump on master, import on standby)"
+  # Do not CREATE/ALTER users on the master. Do not pre-create DBs on standby
+  # as root — dump + CREATE DATABASE IF NOT EXISTS + import is the whole job.
 
   while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
@@ -106,8 +107,21 @@ reconcile_db_passwords() {
     fi
     local sql_pass
     sql_pass="$(printf '%s' "${password}" | sed "s/'/''/g")"
-    printf "ALTER USER '%s'@'localhost' IDENTIFIED BY '%s';\nFLUSH PRIVILEGES;\n" \
-      "$(sql_escape "${db_user}")" "${sql_pass}" >"${sql_file}"
+    {
+      printf "CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY '%s';\n" \
+        "$(sql_escape "${db_user}")" "${sql_pass}"
+      printf "CREATE USER IF NOT EXISTS '%s'@'127.0.0.1' IDENTIFIED BY '%s';\n" \
+        "$(sql_escape "${db_user}")" "${sql_pass}"
+      printf "ALTER USER '%s'@'localhost' IDENTIFIED BY '%s';\n" \
+        "$(sql_escape "${db_user}")" "${sql_pass}"
+      printf "ALTER USER '%s'@'127.0.0.1' IDENTIFIED BY '%s';\n" \
+        "$(sql_escape "${db_user}")" "${sql_pass}"
+      printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'localhost';\n" \
+        "$(sql_escape "${db_name}")" "$(sql_escape "${db_user}")"
+      printf "GRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'127.0.0.1';\n" \
+        "$(sql_escape "${db_name}")" "$(sql_escape "${db_user}")"
+      printf "FLUSH PRIVILEGES;\n"
+    } >"${sql_file}"
     chmod 600 "${sql_file}"
     remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
     rsync -a -e "${rsync_ssh}" "${sql_file}" "$(standby_target):${remote_sql}"
