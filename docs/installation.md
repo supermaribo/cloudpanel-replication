@@ -1,6 +1,20 @@
 # Installation guide
 
-Install from scratch on a **live CloudPanel master** and a **new CloudPanel standby**, linked over Tailscale.
+Complete install from scratch for a **live CloudPanel master** and a **new standby**, linked over Tailscale.
+
+---
+
+## Overview
+
+```
+  STANDBY (step 2)              MASTER (step 3)
+  ─────────────────              ────────────────
+  install-full.sh                install-full.sh
+  choose: 2                        choose: 1
+  pairing token ───────────────► enter token
+  listener running               bootstrap + timer
+                                 read-only on master
+```
 
 ---
 
@@ -10,98 +24,95 @@ Install from scratch on a **live CloudPanel master** and a **new CloudPanel stan
 
 | | Master | Standby |
 |---|--------|---------|
-| **Purpose** | Your live production CloudPanel | Empty mirror target |
-| **CloudPanel** | Already in use with sites | Fresh install, **no sites created** |
-| **clp-sync timer** | Yes (runs every 15 min) | No |
-| **Gets written to** | Only sync state/logs locally | Full mirror of master |
+| **Purpose** | Live production CloudPanel | Empty mirror target |
+| **CloudPanel** | In use with sites | Fresh install, **no sites** |
+| **Sync timer** | Yes (15 min) | No |
+| **Written to** | Sync logs/state only | Full mirror |
 
-### Prerequisites checklist
+### Prerequisites
 
-- [ ] Ubuntu with CloudPanel on **both** servers (same major version)
-- [ ] Tailscale installed and both nodes on the **same tailnet**
-- [ ] You can reach both servers as `root` (or use `sudo`)
-- [ ] Standby has enough disk on `/home` for all master site data (+ ~10% buffer)
+- [ ] Ubuntu 22.04 or 24.04 (recommended)
+- [ ] CloudPanel on **both** (same major version)
+- [ ] Tailscale on **both**, same tailnet
+- [ ] Root access to both servers
+- [ ] Standby `/home` disk ≥ master data + 10%
 
----
+### Install CloudPanel & Tailscale (both servers)
 
-## Step 1 — Prepare the standby
-
-1. Install Ubuntu (22.04 or 24.04 recommended).
-2. Install CloudPanel: https://www.cloudpanel.io/docs/v2/getting-started/
-3. Install Tailscale and join your tailnet:
-
-   ```bash
-   curl -fsSL https://tailscale.com/install.sh | sh
-   tailscale up
-   tailscale status
-   ```
-
-4. **Do not** create sites in the CloudPanel UI on the standby — the master installer will provision them.
-
----
-
-## Step 2 — Install on the standby **first**
+**CloudPanel:**
 
 ```bash
-git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
-cd /root/clp-sync-src
-sudo ./bin/install.sh
+# See official docs for your Ubuntu version:
+# https://www.cloudpanel.io/docs/v2/getting-started/
 ```
 
-### Prompts
+**Tailscale:**
 
-1. **Role:** choose `2` (Standby)
-2. **Compatibility checks** run automatically on this server
-3. **Pairing token** is displayed — **write it down**
-4. **Start pairing listener?** → **Y** (leave this terminal open)
-
-You will see something like:
-
-```
-Tailscale name : cloudpanel-standby
-Tailscale IP   : 100.x.x.x
-Pairing token  : a1b2c3d4e5f6...
-Pair port      : 18765
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+tailscale status
 ```
 
 ---
 
-## Step 3 — Install on the master
+## Method A — One-liner (recommended)
+
+### Step 1 — Standby **first**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
+```
+
+What `install-full.sh` does:
+
+1. Checks root, Tailscale, CloudPanel
+2. Installs `git` / `curl` if missing
+3. Clones repo to `/root/clp-sync-src`
+4. Runs interactive `bin/install.sh`
+
+**Prompts:**
+
+| Prompt | Answer |
+|--------|--------|
+| Role | `2` (Standby) |
+| Compatibility checks | Automatic |
+| Start pairing listener? | `Y` |
+
+**Save:**
+
+- Tailscale name / IP
+- **Pairing token**
+- Port (default `18765`)
+
+Leave the terminal open while the listener runs.
+
+---
+
+### Step 2 — Master **second**
 
 On your **live** CloudPanel server:
 
 ```bash
-git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
-cd /root/clp-sync-src
-sudo ./bin/install.sh
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
 ```
 
-### Prompts
+**Prompts:**
 
-1. **Role:** choose `1` (Master)
-2. **Standby host:** pick from the Tailscale peer list or type the standby name/IP
-3. **Pairing token:** paste the token from step 2
-4. **Pairing port:** press Enter for default `18765`
-5. Installer pairs SSH, runs **cross-host compatibility checks**
-6. **Run first full clone?** → **Y** (`clp-bootstrap`)
-7. **Enable 15-minute timer?** → **Y**
-
-### What the master installer does
-
-| Action | Touches master sites? |
-|--------|----------------------|
-| Installs `/opt/clp-sync` | No |
-| Generates SSH key for standby | No |
-| Reads sites, DBs, files for sync | Read-only |
-| Writes sync state under `/var/lib/clp-sync` | Sync tooling only |
-
-Your live CloudPanel sites, databases, and nginx configs are **never modified** by sync.
+| Prompt | Answer |
+|--------|--------|
+| Role | `1` (Master) |
+| Standby host | Name/IP from step 1 (or peer number) |
+| Pairing token | Paste from step 1 |
+| Pairing port | Enter (default 18765) |
+| Run bootstrap? | `Y` |
+| Enable timer? | `Y` |
 
 ---
 
-## Step 4 — Verify
+### Step 3 — Verify
 
-On the **master**:
+On **master**:
 
 ```bash
 /opt/clp-sync/bin/clp-check all
@@ -110,33 +121,103 @@ systemctl list-timers clp-sync.timer
 journalctl -u clp-sync.service -n 50 --no-pager
 ```
 
-On the **standby**, confirm sites appear in CloudPanel and files exist under `/home/*/htdocs/`.
+On **standby**: sites appear in CloudPanel UI; files under `/home/*/htdocs/`.
 
 ---
 
-## Updating clp-sync
+## Method B — Git clone
 
-On either server after pulling new code:
+```bash
+git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
+cd /root/clp-sync-src
+sudo ./install-full.sh
+```
+
+Or run the interactive installer directly:
+
+```bash
+sudo ./bin/install.sh
+```
+
+Same prompts as Method A.
+
+---
+
+## What gets installed
+
+| Path | Master | Standby |
+|------|:------:|:-------:|
+| `/opt/clp-sync/` | ✓ | ✓ |
+| `/etc/clp-sync/config.env` | ✓ | ✓ |
+| systemd `clp-sync.timer` | ✓ | — |
+| `/root/.ssh/clp_sync_ed25519` | ✓ | — |
+
+---
+
+## Master is read-only
+
+| Action | Modifies live sites? |
+|--------|---------------------|
+| Read files, DBs, configs | No (read only) |
+| mysqldump | No (read only) |
+| Write `/var/lib/clp-sync` | Sync state only |
+| Write to standby | Yes (standby only) |
+
+---
+
+## After install
+
+| Task | Command |
+|------|---------|
+| Manual sync | `clp-sync` |
+| Check health | `clp-check all` |
+| Pause sync | `clp-sync-control off` |
+| Master lost | `clp-promote` (on standby) |
+| Uninstall | `uninstall.sh` |
+
+See [Command reference](commands.md) · [Failover](failover.md)
+
+---
+
+## Updating
 
 ```bash
 cd /root/clp-sync-src
 git pull
-sudo ./bin/install.sh   # re-installs files to /opt/clp-sync
+sudo ./install-full.sh   # updates /opt/clp-sync
 ```
 
-On the master, the timer picks up changes automatically. Re-run `./bin/install.sh` only if you need to reconfigure.
+Or copy only:
+
+```bash
+git pull
+sudo rsync -a --exclude config.env ./ /opt/clp-sync/
+```
 
 ---
 
-## Troubleshooting install
+## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| Tailscale not connected | `tailscale up` on both servers |
-| Pairing fails | Ensure standby listener is running; check token and port |
-| SSH fails after pair | `ssh -i /root/.ssh/clp_sync_ed25519 root@STANDBY` from master |
-| PHP version mismatch | Install missing PHP versions on standby via CloudPanel |
-| Disk too small | Expand standby `/home` or reduce master data |
-| Checks fail | Run `/opt/clp-sync/bin/clp-check all` for details |
+| `Tailscale not connected` | `tailscale up` |
+| `CloudPanel not found` | Install CloudPanel first |
+| Pairing fails | Standby listener running? Token correct? |
+| SSH fails | `ssh -i /root/.ssh/clp_sync_ed25519 root@STANDBY` |
+| PHP mismatch | Install PHP versions on standby (CloudPanel UI) |
+| Disk too small | Expand standby volume |
+| Checks fail | `clp-check all` for details |
 
-See also: [Compatibility checks](compatibility-checks.md) · [Troubleshooting](troubleshooting.md)
+→ [Troubleshooting guide](troubleshooting.md) · [Compatibility checks](compatibility-checks.md)
+
+---
+
+## Environment variables (`install-full.sh`)
+
+```bash
+CLP_SYNC_REPO=https://github.com/supermaribo/cloudpanel-replication.git
+CLP_SYNC_INSTALL_DIR=/root/clp-sync-src
+CLP_SYNC_BRANCH=main
+
+curl -fsSL .../install-full.sh | sudo -E bash
+```

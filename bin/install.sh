@@ -233,5 +233,6 @@ echo "  Status:  /opt/clp-sync/bin/clp-failover-check 30"
 echo "  Logs:    journalctl -u clp-sync.service -f"
 echo "  Manual:  /opt/clp-sync/bin/clp-sync"
 echo "  Docs:    https://github.com/supermaribo/cloudpanel-replication/tree/main/docs"
+echo "  One-liner: curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash"
 echo "  Remove:  /opt/clp-sync/bin/uninstall.sh"
 echo
