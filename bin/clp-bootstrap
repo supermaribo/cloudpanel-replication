@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# One-time / on-demand bootstrap: ensure standby has all sites + DBs, then full sync.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${ROOT}/lib/inventory.sh"
+# shellcheck source=../lib/sync-bootstrap.sh
+source "${ROOT}/lib/sync-bootstrap.sh"
+
+require_root
+load_config
+
+CLP_SYNC_LOG_FILE="${CLP_SYNC_LOG_DIR}/bootstrap-$(date -u +%Y%m%d).log"
+touch "${CLP_SYNC_LOG_FILE}"
+chmod 600 "${CLP_SYNC_LOG_FILE}"
+
+require_cmds ssh sqlite3 openssl clpctl
+log_info "clp-bootstrap → ${STANDBY_HOST}"
+
+remote "echo ok && command -v clpctl" || die "Standby SSH/clpctl check failed"
+
+DB_SNAP="$(inventory_snapshot)"
+run_bootstrap "${DB_SNAP}"
+
+log_info "Running full sync after bootstrap"
+exec "${ROOT}/bin/clp-sync" --skip-bootstrap

@@ -1,0 +1,16 @@
+# Paths relative to each /home/<siteUser>/ being synced.
+# SSH keys (.ssh/) ARE synced so site-user login mirrors the primary.
+# Server SSH host keys are never synced (machines stay distinct on the network).
+
+logs/
+tmp/
+**/cache/
+**/wp-content/cache/
+**/wp-content/uploads/cache/
+**/storage/framework/cache/
+**/storage/framework/sessions/
+**/storage/logs/
+**/node_modules/.cache/
+*.log
+backups/*.sql.gz
+.DS_Store

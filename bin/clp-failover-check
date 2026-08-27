@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Pre-failover sanity checks against last sync status and standby health.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+
+MAX_AGE_MINUTES="${1:-30}"
+
+require_root
+load_config
+
+STATUS_FILE="${CLP_SYNC_STATE_DIR}/last-status"
+FAIL=0
+
+echo "=== clp-failover-check ==="
+echo "Primary:  $(hostname -f 2>/dev/null || hostname)"
+echo "Standby:  ${STANDBY_HOST}"
+echo "Max age:  ${MAX_AGE_MINUTES} minutes"
+echo
+
+if [[ ! -f "${STATUS_FILE}" ]]; then
+  echo "FAIL: no status file at ${STATUS_FILE} (sync never completed?)"
+  exit 1
+fi
+
+echo "--- last-status ---"
+cat "${STATUS_FILE}"
+echo
+
+STATUS="$(grep -E '^status=' "${STATUS_FILE}" | head -1 | cut -d= -f2- || true)"
+FINISHED="$(grep -E '^finished_at=' "${STATUS_FILE}" | head -1 | cut -d= -f2- || true)"
+
+if [[ "${STATUS}" != "ok" ]]; then
+  echo "FAIL: last sync status is '${STATUS}' (want ok)"
+  FAIL=1
+fi
+
+if [[ -n "${FINISHED}" ]]; then
+  FIN_EPOCH="$(date -u -d "${FINISHED}" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "${FINISHED}" +%s 2>/dev/null || echo 0)"
+  NOW_EPOCH="$(date -u +%s)"
+  AGE_MIN=$(( (NOW_EPOCH - FIN_EPOCH) / 60 ))
+  echo "Last sync finish age: ${AGE_MIN} minute(s)"
+  if [[ "${FIN_EPOCH}" -eq 0 ]]; then
+    echo "WARN: could not parse finished_at"
+  elif [[ "${AGE_MIN}" -gt "${MAX_AGE_MINUTES}" ]]; then
+    echo "FAIL: sync older than ${MAX_AGE_MINUTES} minutes"
+    FAIL=1
+  fi
+else
+  echo "FAIL: finished_at missing"
+  FAIL=1
+fi
+
+echo
+echo "--- standby connectivity ---"
+if remote "systemctl is-active nginx >/dev/null 2>&1 || systemctl is-active cloudpanel-nginx >/dev/null 2>&1; systemctl is-active mysql >/dev/null 2>&1 || systemctl is-active mariadb >/dev/null 2>&1; echo nginx_mysql_ok"; then
+  echo "OK: standby SSH + nginx/mysql appear up"
+else
+  echo "FAIL: standby health check failed"
+  FAIL=1
+fi
+
+echo
+echo "--- standby site count ---"
+PRIMARY_SITES="$(sqlite3 "${CLP_DB_PATH}" 'SELECT COUNT(*) FROM site;' 2>/dev/null || echo '?')"
+STANDBY_SITES="$(remote "sqlite3 '${CLP_DB_PATH}' 'SELECT COUNT(*) FROM site;'" 2>/dev/null || echo '?')"
+echo "Primary sites: ${PRIMARY_SITES}"
+echo "Standby sites: ${STANDBY_SITES}"
+if [[ "${PRIMARY_SITES}" != "?" && "${STANDBY_SITES}" != "?" && "${PRIMARY_SITES}" != "${STANDBY_SITES}" ]]; then
+  echo "WARN: site counts differ — bootstrap may be incomplete"
+  FAIL=1
+fi
+
+echo
+if [[ "${FAIL}" -eq 0 ]]; then
+  echo "PASS: standby looks ready for manual failover"
+  exit 0
+fi
+echo "FAIL: resolve issues above before failing over"
+exit 1

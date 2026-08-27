@@ -1,0 +1,18 @@
+[Unit]
+Description=CloudPanel hot-standby sync (primary → standby)
+Documentation=file:///opt/clp-sync/README.md
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/clp-sync/bin/clp-sync
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+# Bound runtime so a hung rsync does not block forever
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target

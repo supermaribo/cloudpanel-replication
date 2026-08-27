@@ -1,0 +1,4 @@
+config.env
+.DS_Store
+*.log
+/var/

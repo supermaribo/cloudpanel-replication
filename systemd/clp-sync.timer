@@ -1,0 +1,13 @@
+[Unit]
+Description=Run CloudPanel hot-standby sync every 15 minutes
+Documentation=file:///opt/clp-sync/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=clp-sync.service
+
+[Install]
+WantedBy=timers.target

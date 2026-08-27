@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# clp-sync — orchestrate primary → standby identical hot-standby mirror.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/inventory.sh
+source "${ROOT}/lib/inventory.sh"
+# shellcheck source=../lib/sync-bootstrap.sh
+source "${ROOT}/lib/sync-bootstrap.sh"
+# shellcheck source=../lib/sync-files.sh
+source "${ROOT}/lib/sync-files.sh"
+# shellcheck source=../lib/sync-mysql.sh
+source "${ROOT}/lib/sync-mysql.sh"
+# shellcheck source=../lib/sync-nginx-ssl.sh
+source "${ROOT}/lib/sync-nginx-ssl.sh"
+# shellcheck source=../lib/sync-panel-meta.sh
+source "${ROOT}/lib/sync-panel-meta.sh"
+# shellcheck source=../lib/sync-users.sh
+source "${ROOT}/lib/sync-users.sh"
+
+SKIP_BOOTSTRAP=0
+SKIP_FILES=0
+SKIP_MYSQL=0
+SKIP_NGINX=0
+SKIP_USERS=0
+DRY_CONNECT_ONLY=0
+
+usage() {
+  cat <<'EOF'
+Usage: clp-sync [options]
+
+  Identical hot-standby mirror: this CloudPanel primary → STANDBY_HOST (Tailscale).
+  Syncs sites, files, SSH keys, SSL/Let's Encrypt certs, users/passwords,
+  MySQL, nginx, PHP-FPM, crons, FTP users, and CloudPanel panel DB.
+
+Options:
+  --skip-bootstrap   Do not create missing sites/DBs on standby
+  --skip-files       Skip rsync of /home/<siteUser>
+  --skip-mysql       Skip MySQL dump/import
+  --skip-nginx       Skip nginx/SSL/PHP-FPM/cron sync
+  --skip-users       Skip Linux password/SSH identity + FTP provisioning
+  --connect-only     Only test SSH to standby, then exit
+  -h, --help         Show help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-bootstrap) SKIP_BOOTSTRAP=1 ;;
+    --skip-files) SKIP_FILES=1 ;;
+    --skip-mysql) SKIP_MYSQL=1 ;;
+    --skip-nginx) SKIP_NGINX=1 ;;
+    --skip-users) SKIP_USERS=1 ;;
+    --connect-only) DRY_CONNECT_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+
+require_root
+load_config
+
+: "${APPLY_PANEL_DB:=1}"
+: "${SYNC_EXTRA_USERS:=clp}"
+
+CLP_SYNC_LOG_FILE="${CLP_SYNC_LOG_DIR}/sync-$(date -u +%Y%m%d).log"
+touch "${CLP_SYNC_LOG_FILE}"
+chmod 600 "${CLP_SYNC_LOG_FILE}"
+
+LOCK_FILE="${CLP_SYNC_STATE_DIR}/clp-sync.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  die "Another clp-sync run holds ${LOCK_FILE}"
+fi
+
+START_TS="$(date +%s)"
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
+
+require_cmds ssh rsync sqlite3 flock openssl
+log_info "clp-sync starting (full mirror) → ${STANDBY_HOST}"
+
+log_info "Testing SSH to standby"
+if ! remote "echo ok && command -v clpctl && command -v sqlite3 && command -v nginx"; then
+  die "Cannot reach standby or missing clpctl/sqlite3/nginx"
+fi
+
+if [[ "${DRY_CONNECT_ONLY}" -eq 1 ]]; then
+  log_ok "Connectivity OK"
+  write_status ok "connect-only"
+  trap - EXIT
+  exit 0
+fi
+
+DB_SNAP="$(inventory_snapshot)"
+log_info "Inventory snapshot: ${DB_SNAP}"
+
+if [[ "${SKIP_BOOTSTRAP}" -eq 0 ]]; then
+  run_bootstrap "${DB_SNAP}"
+fi
+
+if [[ "${SKIP_USERS}" -eq 0 ]]; then
+  sync_ftp_users "${DB_SNAP}"
+fi
+
+if [[ "${SKIP_FILES}" -eq 0 ]]; then
+  sync_site_files "${DB_SNAP}"
+fi
+
+if [[ "${SKIP_USERS}" -eq 0 ]]; then
+  # After files (.ssh) land, apply identical password hashes + key perms
+  sync_user_identities "${DB_SNAP}"
+fi
+
+if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
+  sync_mysql "${DB_SNAP}"
+fi
+
+if [[ "${SKIP_NGINX}" -eq 0 ]]; then
+  sync_nginx_ssl
+  sync_php_fpm_pools
+  sync_crons "${DB_SNAP}"
+fi
+
+sync_panel_data_files
+sync_panel_meta "${DB_SNAP}"
+
+DURATION="$(( $(date +%s) - START_TS ))"
+write_status ok "duration_s=${DURATION}"
+log_ok "clp-sync finished (identical mirror) in ${DURATION}s"
+trap - EXIT
+exit 0
