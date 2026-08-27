@@ -303,6 +303,7 @@ sync_panel_accounts() {
   sync_panel_data_files
   sync_panel_meta "$1"
   disable_standby_backups
+  disable_standby_cloud_images
 }
 
 # Keep backup destinations/credentials in the panel DB and rclone configs.
@@ -393,6 +394,102 @@ EOS
   log_ok "Standby backup jobs disabled (S3/local credentials unchanged)"
 }
 
+# Copying master's panel DB would re-enable AWS "Automatic Images" on the
+# standby. That cron (clpctl aws:image:create) uses the copied AWS keys and
+# can snapshot the live master instance. Disable cron + sqlite flag on standby.
+disable_standby_cloud_images() {
+  log_info "Disabling Automatic Images / cloud snapshots on standby"
+  remote bash -s -- "${CLP_DB_PATH}" <<'EOS'
+set -euo pipefail
+python3 - "$1" <<'PY'
+import pathlib, re, sqlite3, sys
+
+MARKER = "# clp-sync: cloud images/snapshots disabled on standby\n"
+JOB_RE = re.compile(
+    r"aws:image:create|do:snapshot:create|hetzner:snapshot:create|"
+    r"gce:snapshot:create|vultr:snapshot:create|:image:create|:snapshot:create",
+    re.I,
+)
+COL_RE = re.compile(
+    r"(automatic[_ ]?(images?|snapshots?)|(images?|snapshots?)[_ ]?automatic|"
+    r"is_automatic_(images?|snapshots?))",
+    re.I,
+)
+
+def disable_cron(path: pathlib.Path) -> bool:
+    if not path.is_file():
+        return False
+    text = path.read_text(errors="replace")
+    lines = text.splitlines(True)
+    out = []
+    if not any("clp-sync: cloud images/snapshots disabled" in ln for ln in lines):
+        out.append(MARKER)
+    changed = False
+    comment_all = path.name in (
+        "clp-aws", "clp-do", "clp-gce", "clp-hetzner", "clp-vultr",
+    )
+    for line in lines:
+        raw = line.rstrip("\n")
+        if "clp-sync: cloud images/snapshots disabled" in raw:
+            continue
+        stripped = raw.lstrip()
+        if stripped.startswith("#") or not stripped:
+            out.append(line if line.endswith("\n") else line + "\n")
+            continue
+        if comment_all or JOB_RE.search(stripped):
+            out.append("# clp-sync-disabled: " + stripped + "\n")
+            changed = True
+        else:
+            out.append(line if line.endswith("\n") else line + "\n")
+    new = "".join(out)
+    if new != text:
+        path.write_text(new)
+        return True
+    return changed
+
+changed = False
+for p in (
+    pathlib.Path("/etc/cron.d/clp-aws"),
+    pathlib.Path("/etc/cron.d/clp-do"),
+    pathlib.Path("/etc/cron.d/clp-gce"),
+    pathlib.Path("/etc/cron.d/clp-hetzner"),
+    pathlib.Path("/etc/cron.d/clp-vultr"),
+    pathlib.Path("/etc/cron.d/clp"),
+):
+    try:
+        if disable_cron(p):
+            print("disabled cloud image jobs in", p)
+            changed = True
+    except OSError as e:
+        print("skip", p, e)
+
+db = sys.argv[1]
+sqlite_changed = 0
+try:
+    con = sqlite3.connect(db)
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    for table in tables:
+        cols = list(con.execute(f'PRAGMA table_info("{table}")'))
+        names = [c[1] for c in cols]
+        targets = [n for n in names if COL_RE.search(n)]
+        if not targets:
+            continue
+        sets = ", ".join(f'"{n}" = 0' for n in targets)
+        con.execute(f'UPDATE "{table}" SET {sets}')
+        n = con.total_changes
+        sqlite_changed += n
+        print("sqlite", table, "cleared", ",".join(targets))
+    con.commit()
+except sqlite3.Error as e:
+    print("sqlite skip", e)
+
+if not changed and sqlite_changed == 0:
+    print("no automatic image jobs/settings found")
+PY
+EOS
+  log_ok "Standby Automatic Images disabled (AWS credentials kept, jobs off)"
+}
+
 enable_standby_backups() {
   log_info "Re-enabling CloudPanel backup jobs (promotion)"
   python3 - <<'PY'
@@ -402,12 +499,19 @@ for p in (
     pathlib.Path("/etc/cron.d/clp"),
     pathlib.Path("/etc/cron.d/clp-rclone"),
     pathlib.Path("/etc/cron.d/clp-remote-backup"),
+    pathlib.Path("/etc/cron.d/clp-aws"),
+    pathlib.Path("/etc/cron.d/clp-do"),
+    pathlib.Path("/etc/cron.d/clp-gce"),
+    pathlib.Path("/etc/cron.d/clp-hetzner"),
+    pathlib.Path("/etc/cron.d/clp-vultr"),
 ):
     if not p.is_file():
         continue
     lines = []
     for line in p.read_text(errors="replace").splitlines():
         if "clp-sync: backups disabled on standby" in line:
+            continue
+        if "clp-sync: cloud images/snapshots disabled" in line:
             continue
         lines.append(prefix.sub("", line))
     p.write_text("\n".join(lines) + ("\n" if lines else ""))
@@ -420,6 +524,8 @@ for user in ("clp", "clp-admin"):
     lines = []
     for line in current.splitlines():
         if "clp-sync: backups disabled on standby" in line:
+            continue
+        if "clp-sync: cloud images/snapshots disabled" in line:
             continue
         lines.append(prefix.sub("", line))
     body = "\n".join(lines) + "\n"

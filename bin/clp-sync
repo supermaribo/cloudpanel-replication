@@ -163,6 +163,7 @@ if [[ "${SKIP_NGINX}" -eq 0 ]]; then
   sync_php_fpm_pools
   sync_crons "${DB_SNAP}"
   disable_standby_backups
+  disable_standby_cloud_images
 fi
 
 if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
@@ -172,6 +173,7 @@ fi
 log_info "Refreshing CloudPanel panel sqlite after data sync"
 sync_panel_meta "${DB_SNAP}"
 disable_standby_backups
+disable_standby_cloud_images
 
 DURATION="$(( $(date +%s) - START_TS ))"
 write_status ok "duration_s=${DURATION}"
