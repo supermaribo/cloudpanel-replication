@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Standby-only MySQL import helper.
 
-NEVER run this on the live master. It may restart mysqld and ALTER root
-on the standby so CloudPanel's copied sqlite password matches Percona.
+NEVER run this on the live master. Dump is read-only on the master.
+This file only runs over SSH on the standby.
 
-Dump happens on the master (read-only). This file only runs over SSH on
-the standby: create database + import.
+Do not put skip-grant-tables in systemd drop-ins. Debian AppArmor
+blocks init-file under /var/lib/clp-sync and mysqld then refuses to start.
 """
 from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,18 @@ os.environ.pop("MYSQL_UNIX_PORT", None)
 os.environ.pop("MYSQL_PWD", None)
 
 PERSIST_CNF = "/var/lib/clp-sync/standby-mysql-root.cnf"
-SKIP_GRANT_ONCE = "/var/lib/clp-sync/mysql-skip-grant-done"
+SOCKETS = (
+    "/run/mysqld/mysqld.sock",
+    "/var/run/mysqld/mysqld.sock",
+    "/tmp/mysql.sock",
+)
+DROPIN_DIRS = (
+    "/etc/mysql/mysql.conf.d",
+    "/etc/mysql/conf.d",
+    "/etc/mysql/mariadb.conf.d",
+    "/etc/mysql/percona-server.conf.d",
+    "/etc/percona-server.conf.d",
+)
 
 
 def assert_standby():
@@ -108,6 +120,22 @@ def persist_cnf(user, password, port):
     print("standby-mysql: saved working client cnf on standby", flush=True)
 
 
+def persist_socket_cnf(sock):
+    os.makedirs("/var/lib/clp-sync", exist_ok=True)
+    with open(PERSIST_CNF, "w") as f:
+        f.write(f"[client]\nuser=root\nsocket={sock}\nprotocol=socket\n")
+    os.chmod(PERSIST_CNF, 0o600)
+    print("standby-mysql: saved socket client cnf on standby", flush=True)
+
+
+def cnf_is_socket(path):
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+    return "protocol=socket" in text.replace(" ", "")
+
+
 def probe(cmd, timeout=15, secret=""):
     env = os.environ.copy()
     env.pop("MYSQL_PWD", None)
@@ -133,20 +161,14 @@ def probe(cmd, timeout=15, secret=""):
 
 
 def mysql_cmd(cnf):
-    return ["mysql", f"--defaults-file={cnf}", "--batch", "--raw", "--quick"]
+    cmd = ["mysql", f"--defaults-file={cnf}", "--batch", "--raw", "--quick", "--connect-timeout=5"]
+    if cnf_is_socket(cnf):
+        cmd.append("--skip-password")
+    return cmd
 
 
 def conf_dirs():
-    # Percona/MySQL only. Do not write mariadb.conf.d on this stack.
-    dirs = []
-    for p in (
-        "/etc/mysql/mysql.conf.d",
-        "/etc/mysql/conf.d",
-        "/etc/mysql/percona-server.conf.d",
-        "/etc/percona-server.conf.d",
-    ):
-        if os.path.isdir(p):
-            dirs.append(p)
+    dirs = [p for p in DROPIN_DIRS if os.path.isdir(p)]
     if not dirs:
         os.makedirs("/etc/mysql/conf.d", exist_ok=True)
         dirs.append("/etc/mysql/conf.d")
@@ -155,6 +177,8 @@ def conf_dirs():
 
 def write_server_dropin(filename, body):
     for d in conf_dirs():
+        if "mariadb.conf.d" in d:
+            continue
         path = os.path.join(d, filename)
         with open(path, "w") as f:
             f.write(body)
@@ -163,7 +187,7 @@ def write_server_dropin(filename, body):
 
 
 def remove_server_dropin(filename):
-    for d in conf_dirs():
+    for d in DROPIN_DIRS:
         path = os.path.join(d, filename)
         try:
             os.unlink(path)
@@ -179,23 +203,85 @@ def mysql_unit():
     return "mysql"
 
 
-def wait_mysql_up(timeout=45):
-    unit = mysql_unit()
+def wait_socket(timeout=45):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if subprocess.call(["systemctl", "is-active", "--quiet", unit]) == 0:
-            for sock in ("/run/mysqld/mysqld.sock", "/var/run/mysqld/mysqld.sock"):
-                if os.path.exists(sock):
+        if any(os.path.exists(s) for s in SOCKETS):
+            time.sleep(0.5)
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def wait_mysql_up(timeout=45):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for name in ("mysql", "mysqld"):
+            if subprocess.call(["systemctl", "is-active", "--quiet", name]) == 0:
+                if any(os.path.exists(s) for s in SOCKETS):
                     time.sleep(1)
                     return True
-        time.sleep(1)
-    return subprocess.call(["systemctl", "is-active", "--quiet", unit]) == 0
+        time.sleep(0.5)
+    return False
+
+
+def start_systemd_mysql():
+    for name in ("mysql", "mysqld"):
+        subprocess.call(
+            ["systemctl", "reset-failed", name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"standby-mysql: starting {name} (standby only)", flush=True)
+        rc = subprocess.call(["systemctl", "start", name])
+        if rc == 0 and wait_mysql_up(45):
+            return True
+    return wait_mysql_up(15)
+
+
+def stop_systemd_mysql():
+    for name in ("mysql", "mysqld"):
+        subprocess.call(
+            ["systemctl", "stop", name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if not any(os.path.exists(s) for s in SOCKETS):
+            return
+        time.sleep(0.5)
+
+
+def rescue_mysql():
+    """Undo the skip-grant systemd drop-in that crashed mysqld, then start it."""
+    remove_server_dropin("zz-clp-sync-skip-grant.cnf")
+    for path in (
+        "/var/lib/clp-sync/mysql-init-align.sql",
+        "/var/lib/mysql/clp-sync-init.sql",
+    ):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    if any(os.path.exists(s) for s in SOCKETS) and subprocess.call(
+        ["systemctl", "is-active", "--quiet", "mysql"]
+    ) == 0:
+        return
+    print("standby-mysql: recovering standby mysql after skip-grant drop-in failure", flush=True)
+    if not start_systemd_mysql():
+        print("standby-mysql: warning: mysql did not start after drop-in cleanup", flush=True)
 
 
 def restart_mysql():
     unit = mysql_unit()
     print(f"standby-mysql: restarting {unit} (standby only)", flush=True)
-    subprocess.check_call(["systemctl", "restart", unit])
+    rc = subprocess.call(["systemctl", "restart", unit])
+    if rc != 0:
+        rescue_mysql()
+        return
     if not wait_mysql_up():
         print("standby-mysql: warning: mysql did not become ready after restart", flush=True)
 
@@ -205,6 +291,7 @@ def ensure_skip_name_resolve():
     already = any(
         os.path.isfile(os.path.join(d, "zz-clp-sync-skip-name-resolve.cnf"))
         for d in conf_dirs()
+        if "mariadb.conf.d" not in d
     )
     write_server_dropin("zz-clp-sync-skip-name-resolve.cnf", "[mysqld]\nskip-name-resolve=ON\n")
     os.makedirs("/var/lib/clp-sync", exist_ok=True)
@@ -217,17 +304,6 @@ def ensure_skip_name_resolve():
     return True
 
 
-def chown_mysql(path):
-    try:
-        import grp
-        import pwd
-
-        os.chown(path, pwd.getpwnam("mysql").pw_uid, grp.getgrnam("mysql").gr_gid)
-    except Exception:
-        pass
-    os.chmod(path, 0o600)
-
-
 def looks_like_cnf(path):
     try:
         head = open(path, encoding="utf-8", errors="replace").read(4096)
@@ -236,72 +312,193 @@ def looks_like_cnf(path):
     return "[client]" in head or "[mysql]" in head
 
 
-def align_sql(user, password):
-    escaped = sql_quote(password)
-    return [
-        "FLUSH PRIVILEGES",
-        f"CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
-        f"CREATE USER IF NOT EXISTS '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
-        f"ALTER USER '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
-        f"ALTER USER '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
-        "FLUSH PRIVILEGES",
-    ]
+def socket_root_cmd(sock=None):
+    socks = (sock,) if sock else SOCKETS
+    for path in socks:
+        if not os.path.exists(path):
+            continue
+        cmd = [
+            "mysql",
+            "-u",
+            "root",
+            "--protocol=SOCKET",
+            f"--socket={path}",
+            "--skip-password",
+            "--batch",
+            "--raw",
+            "--quick",
+            "--connect-timeout=5",
+        ]
+        print(f"standby-mysql: trying socket root {path}", flush=True)
+        if probe(cmd):
+            print("standby-mysql: auth=socket-root", flush=True)
+            persist_socket_cnf(path)
+            return cmd
+    return None
 
 
-def socket_root_sql(sql, secret):
+def run_sql(cmd, sql, secret=""):
     env = os.environ.copy()
     env.pop("MYSQL_PWD", None)
-    attempts = (
-        ["mysql", "-u", "root", "--protocol=SOCKET", "--batch", "--skip-password", "-e", sql],
-        ["mysql", "-u", "root", "--batch", "--skip-password", "-e", sql],
+    p = subprocess.run(
+        cmd + ["-e", sql],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        text=True,
+        env=env,
     )
-    for args in attempts:
-        p = subprocess.run(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=20,
-            text=True,
-            env=env,
-        )
-        err = redact((p.stderr or "") + (p.stdout or ""), secret)
-        print(f"standby-mysql: socket-sql rc={p.returncode} {err[-200:]}", flush=True)
-        if p.returncode == 0:
-            return True
-    return False
+    err = redact((p.stderr or "") + (p.stdout or ""), secret)
+    print(f"standby-mysql: sql rc={p.returncode} {err[-200:]}", flush=True)
+    return p.returncode == 0
 
 
-def skip_grant_align_root(user, password):
-    """Standby Percona only. MySQL 8 blocks ALTER USER under
-    skip-grant-tables until FLUSH PRIVILEGES in that session.
-    init-file runs that at startup. Socket SQL is the fallback.
+def align_tcp_root(cmd, user, password):
+    """Set root@127.0.0.1 only. Leave root@localhost as unix_socket."""
+    escaped = sql_quote(password)
+    ok = False
+    for sql in (
+        f"CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        f"ALTER USER '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        "FLUSH PRIVILEGES",
+    ):
+        if run_sql(cmd, sql, password):
+            ok = True
+    return ok
+
+
+def mysqld_bin():
+    for p in ("/usr/sbin/mysqld", "/usr/sbin/mariadbd", "/usr/libexec/mysqld"):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def tail_mysql_error():
+    for path in (
+        "/var/log/mysql/error.log",
+        "/var/lib/mysql/error.log",
+        "/var/log/mysql/clp-repair.err",
+        "/var/lib/mysql/clp-repair.err",
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for line in lines[-8:]:
+            print(f"standby-mysql: mysqld-log {line[:200]}", flush=True)
+
+
+def skip_grant_oneshot(user, password):
+    """Stop systemd mysql, start mysqld --skip-grant-tables ourselves, ALTER
+    root@127.0.0.1, then start systemd mysql again. No conf.d drop-in.
     """
-    print("standby-mysql: aligning standby root password (skip-grant-tables, not master)", flush=True)
-    os.makedirs("/var/lib/clp-sync", exist_ok=True)
-    init_path = "/var/lib/clp-sync/mysql-init-align.sql"
-    with open(init_path, "w") as f:
-        f.write(";\n".join(align_sql(user, password)) + ";\n")
-    chown_mysql(init_path)
-    write_server_dropin(
-        "zz-clp-sync-skip-grant.cnf",
-        "[mysqld]\nskip-grant-tables\nskip-networking\n"
-        f"init-file={init_path}\n",
-    )
-    restart_mysql()
-    any_ok = False
-    for sql in align_sql(user, password):
-        if socket_root_sql(sql, password):
-            any_ok = True
-    try:
-        os.unlink(init_path)
-    except OSError:
-        pass
+    print("standby-mysql: one-shot skip-grant mysqld (standby only, not systemd)", flush=True)
     remove_server_dropin("zz-clp-sync-skip-grant.cnf")
-    restart_mysql()
-    with open(SKIP_GRANT_ONCE, "w") as f:
-        f.write("1\n")
-    return any_ok
+    binary = mysqld_bin()
+    if not binary:
+        print("standby-mysql: mysqld binary not found", flush=True)
+        return False
+
+    stop_systemd_mysql()
+    os.makedirs("/run/mysqld", exist_ok=True)
+    os.makedirs("/var/lib/clp-sync", exist_ok=True)
+    try:
+        import grp
+        import pwd
+
+        os.chown(
+            "/run/mysqld",
+            pwd.getpwnam("mysql").pw_uid,
+            grp.getgrnam("mysql").gr_gid,
+        )
+    except Exception:
+        pass
+
+    sock = "/run/mysqld/mysqld.sock"
+    pidfile = "/run/mysqld/mysqld-clp-repair.pid"
+    if os.path.isdir("/var/log/mysql"):
+        errfile = "/var/log/mysql/clp-repair.err"
+    else:
+        errfile = "/var/lib/mysql/clp-repair.err"
+    for leftover in (sock, pidfile):
+        try:
+            os.unlink(leftover)
+        except FileNotFoundError:
+            pass
+
+    cmd = [binary, "--skip-grant-tables", "--skip-networking", "--user=mysql"]
+    if os.path.isfile("/etc/mysql/my.cnf"):
+        cmd[1:1] = ["--defaults-file=/etc/mysql/my.cnf"]
+    cmd += [f"--socket={sock}", f"--pid-file={pidfile}", f"--log-error={errfile}"]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    up = False
+    try:
+        for _ in range(40):
+            if os.path.exists(sock):
+                up = True
+                break
+            if proc.poll() is not None:
+                time.sleep(1)
+                if os.path.exists(sock):
+                    up = True
+                    break
+                print(f"standby-mysql: oneshot mysqld exited {proc.returncode}", flush=True)
+                tail_mysql_error()
+                break
+            time.sleep(0.5)
+        if not up:
+            print("standby-mysql: oneshot mysqld did not create a socket", flush=True)
+            tail_mysql_error()
+            return False
+        client = [
+            "mysql",
+            "-u",
+            "root",
+            "--protocol=SOCKET",
+            f"--socket={sock}",
+            "--skip-password",
+            "--batch",
+            "--raw",
+            "--quick",
+        ]
+        if not probe(client):
+            print("standby-mysql: oneshot socket probe failed", flush=True)
+            return False
+        run_sql(client, "FLUSH PRIVILEGES", password)
+        align_tcp_root(client, user, password)
+        return True
+    finally:
+        pid = None
+        if os.path.isfile(pidfile):
+            try:
+                pid = int(open(pidfile, encoding="utf-8").read().strip())
+            except (OSError, ValueError):
+                pid = None
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        elif proc.poll() is None:
+            proc.terminate()
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if proc.poll() is not None and not os.path.exists(sock):
+                break
+            time.sleep(0.3)
+        if proc.poll() is None:
+            proc.kill()
+        start_systemd_mysql()
 
 
 def try_extra_cnfs():
@@ -323,9 +520,31 @@ def try_extra_cnfs():
 
 def build_client():
     assert_standby()
+    rescue_mysql()
+
     extra, temps = try_extra_cnfs()
     if extra:
         return extra, temps, None
+
+    sock_cmd = socket_root_cmd()
+    if sock_cmd:
+        try:
+            user, password, port = parse_clpctl()
+            if align_tcp_root(sock_cmd, user, password):
+                cnf = write_cnf(user, password, "127.0.0.1", port)
+                tcp = mysql_cmd(cnf)
+                if probe(tcp, secret=password):
+                    print("standby-mysql: auth=cloudpanel-tcp after socket align", flush=True)
+                    persist_cnf(user, password, port)
+                    return tcp, [cnf], None
+                temps = [cnf]
+            else:
+                temps = []
+        except Exception as e:
+            print(f"standby-mysql: tcp align skipped: {e}", flush=True)
+            temps = []
+        print("standby-mysql: importing via socket root (no systemd mysql restart)", flush=True)
+        return sock_cmd, temps, None
 
     user, password, port = parse_clpctl()
     cnf = write_cnf(user, password, "127.0.0.1", port)
@@ -339,14 +558,21 @@ def build_client():
 
     print("standby-mysql: panel password does not match standby MySQL yet", flush=True)
     ensure_skip_name_resolve()
+    sock_cmd = socket_root_cmd()
+    if sock_cmd:
+        print("standby-mysql: importing via socket root", flush=True)
+        return sock_cmd, temps, None
     if probe(tcp, secret=password):
         print("standby-mysql: auth=cloudpanel-tcp after skip-name-resolve", flush=True)
         persist_cnf(user, password, port)
         return tcp, temps, None
 
-    skip_grant_align_root(user, password)
+    skip_grant_oneshot(user, password)
+    sock_cmd = socket_root_cmd()
+    if sock_cmd:
+        return sock_cmd, temps, None
     if probe(tcp, secret=password):
-        print("standby-mysql: auth=cloudpanel-tcp after standby root align", flush=True)
+        print("standby-mysql: auth=cloudpanel-tcp after oneshot skip-grant", flush=True)
         persist_cnf(user, password, port)
         return tcp, temps, None
 
@@ -356,7 +582,7 @@ def build_client():
 
     sys.exit(
         "standby mysql import auth failed. Master was not changed. "
-        "Dump already works; standby root password does not match panel sqlite."
+        "Dump already works; standby MySQL would not accept a client."
     )
 
 
