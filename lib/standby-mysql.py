@@ -319,6 +319,7 @@ def socket_root_cmd(sock=None):
             continue
         cmd = [
             "mysql",
+            "--no-defaults",
             "-u",
             "root",
             "--protocol=SOCKET",
@@ -326,7 +327,6 @@ def socket_root_cmd(sock=None):
             "--skip-password",
             "--batch",
             "--raw",
-            "--quick",
             "--connect-timeout=5",
         ]
         print(f"standby-mysql: trying socket root {path}", flush=True)
@@ -610,11 +610,26 @@ def main():
             )
             sql_path = gz[:-3] if gz.endswith(".gz") else gz + ".sql"
             print(f"standby-mysql: decompress {gz}", flush=True)
-            with open(sql_path, "wb") as outf:
-                subprocess.check_call(["gunzip", "-c", gz], stdout=outf, timeout=180)
-            print(f"standby-mysql: import {db}", flush=True)
+            with subprocess.Popen(["gunzip", "-c", gz], stdout=subprocess.PIPE) as proc:
+                with open(sql_path, "wb") as outf:
+                    for line in proc.stdout:
+                        if b"sandbox mode" in line[:80]:
+                            continue
+                        if line.lstrip().upper().startswith(b"SET @@GLOBAL.GTID_PURGED"):
+                            continue
+                        outf.write(line)
+                if proc.wait() != 0:
+                    sys.exit(f"gunzip failed for {gz}")
+            size = os.path.getsize(sql_path)
+            print(f"standby-mysql: import {db} ({size} bytes, binary-mode)", flush=True)
             with open(sql_path, "rb") as inf:
-                run_cmd(cmd, [db], env=env, stdin=inf, timeout=600)
+                run_cmd(
+                    cmd,
+                    ["--binary-mode", "--force", db],
+                    env=env,
+                    stdin=inf,
+                    timeout=600,
+                )
             os.unlink(sql_path)
             print(f"standby-mysql: import {db} done", flush=True)
         else:

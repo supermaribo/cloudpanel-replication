@@ -117,6 +117,7 @@ dump_database() {
   if mysql_cli --batch -N -e "SELECT 1" >/dev/null 2>&1; then
     if mysqldump_cli --single-transaction --quick --routines --triggers \
       --skip-dump-date \
+      --set-gtid-purged=OFF \
       --default-character-set=utf8mb4 \
       "${db_name}" | gzip -c >"${dest}" && [[ -s "${dest}" ]]; then
       return 0
