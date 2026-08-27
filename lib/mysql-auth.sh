@@ -129,44 +129,65 @@ dump_database() {
   clpctl db:export --databaseName="${db_name}" --file="${dest}"
 }
 
-# Run mysql on the standby using CloudPanel master credentials.
-# mode: query <sql> | exec-file <path> | import-gz <db> <gz>
-# Never probe passwordless mysql — it can hang on a password prompt.
-_remote_mysql() {
-  local helper="${CLP_SYNC_ROOT}/lib/standby-mysql.py"
-  local rsync_ssh remote_helper="/var/tmp/clp-sync-import/standby-mysql.py"
-  [[ -f "${helper}" ]] || die "Missing ${helper}"
-  rsync_ssh="$(rsync_ssh_cmd)"
-  remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
-  rsync -a -e "${rsync_ssh}" "${helper}" "$(standby_target):${remote_helper}"
-  remote python3 "${remote_helper}" "$@"
+# Standby mysql client: unix socket root, no ~/.my.cnf, no python.
+# Stdin is forwarded (dump import). Extra args are appended on the remote side.
+_standby_mysql() {
+  local extra=""
+  extra="$(printf '%q ' "$@")"
+  ssh_opts
+  ssh "${SSH_OPTS[@]}" -o ServerAliveInterval=5 -o ServerAliveCountMax=120 \
+    "$(standby_target)" \
+    "m=/usr/bin/mysql; [ -x \"\$m\" ] || m=\$(command -v mysql)
+     [ -n \"\$m\" ] || { echo standby-mysql: mysql client missing >&2; exit 1; }
+     sock=/run/mysqld/mysqld.sock; [ -S \"\$sock\" ] || sock=/var/run/mysqld/mysqld.sock
+     [ -S \"\$sock\" ] || { echo standby-mysql: no mysqld socket >&2; exit 1; }
+     exec \"\$m\" --no-defaults -u root --protocol=SOCKET --socket=\"\$sock\" --skip-password --batch --force --binary-mode --max-allowed-packet=512M ${extra}"
+}
+
+kill_stale_standby_imports() {
+  remote 'pkill -f /var/tmp/clp-sync-import 2>/dev/null || true
+    pkill -f standby-mysql.py 2>/dev/null || true
+    true'
+}
+
+# Dump is local .sql.gz. CREATE DATABASE then stream gunzip | ssh mysql.
+import_database_standby() {
+  local db_name="$1" dump_gz="$2"
+  [[ "${db_name}" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+  [[ -s "${dump_gz}" ]] || return 1
+
+  kill_stale_standby_imports
+
+  log_info "CREATE DATABASE ${db_name} on standby"
+  if ! _standby_mysql -N -e "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"; then
+    log_error "CREATE DATABASE ${db_name} failed on standby"
+    return 1
+  fi
+
+  log_info "Streaming ${db_name} into standby mysql (dump | ssh, socket root)"
+  if ! gunzip -c "${dump_gz}" \
+      | grep -v 'sandbox mode' \
+      | grep -v '^SET @@GLOBAL.GTID_PURGED' \
+      | _standby_mysql --init-command='SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION UNIQUE_CHECKS=0;' "${db_name}"; then
+    log_error "Import stream failed for ${db_name}"
+    return 1
+  fi
+  return 0
 }
 
 remote_mysql_query() {
-  _remote_mysql query "$1"
+  _standby_mysql -N -e "$1"
 }
 
-# Run a SQL string on the standby with CloudPanel MySQL credentials.
 remote_mysql_sql() {
-  local sql="$1"
-  local f="${CLP_SYNC_TMP_DIR}/remote-one.sql"
-  local rsync_ssh rc=0
-  rsync_ssh="$(rsync_ssh_cmd)"
-  printf '%s\n' "${sql}" >"${f}"
-  chmod 600 "${f}"
-  remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
-  rsync -a -e "${rsync_ssh}" "${f}" "$(standby_target):/var/tmp/clp-sync-import/remote-one.sql"
-  remote_mysql_file /var/tmp/clp-sync-import/remote-one.sql || rc=$?
-  remote "rm -f /var/tmp/clp-sync-import/remote-one.sql" || true
-  return "${rc}"
+  _standby_mysql -e "$1"
 }
 
-# Run a SQL file on the standby with that host's CloudPanel MySQL credentials.
 remote_mysql_file() {
-  _remote_mysql exec-file "$1"
+  local sql_file="$1"
+  _standby_mysql <"${sql_file}"
 }
 
 remote_mysql_import_gz() {
-  local db_name="$1" remote_gz="$2"
-  _remote_mysql import-gz "${db_name}" "${remote_gz}"
+  import_database_standby "$1" "$2"
 }
