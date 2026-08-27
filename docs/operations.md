@@ -31,9 +31,27 @@ Day-to-day management of CloudPanel hot-standby sync.
 # Full compatibility report
 /opt/clp-sync/bin/clp-check all
 
-# Pre-failover readiness
+# Pre-failover readiness (on master)
 /opt/clp-sync/bin/clp-failover-check 30
+
+# Pause / resume sync
+/opt/clp-sync/bin/clp-sync-control off
+/opt/clp-sync/bin/clp-sync-control on
+/opt/clp-sync/bin/clp-sync-control status
 ```
+
+## Failover commands (standby → master)
+
+```bash
+# On STANDBY when master is lost
+/opt/clp-sync/bin/clp-promote
+
+# After promotion — add a new standby
+/opt/clp-sync/bin/clp-set-standby
+/opt/clp-sync/bin/clp-bootstrap
+```
+
+See [Failover guide](failover.md).
 
 ---
 
