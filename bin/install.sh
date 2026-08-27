@@ -9,6 +9,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/lib/install-common.sh"
 # shellcheck source=../lib/checks.sh
 source "${ROOT}/lib/checks.sh"
+# shellcheck source=../lib/master-readonly.sh
+source "${ROOT}/lib/master-readonly.sh"
 
 require_root_install
 
@@ -78,7 +80,7 @@ fi
 # STANDBY
 # --------------------------------------------------------------------------
 if [[ "${ROLE}" == "standby" ]]; then
-  ensure_packages_standby
+  verify_standby_tools || exit 1
   write_config standby "" ""
 
   TOKEN="$(generate_pair_token)"
@@ -120,15 +122,12 @@ if [[ "${ROLE}" == "standby" ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# MASTER
+# MASTER — never apt-get, never clpctl, never modify CloudPanel stack
 # --------------------------------------------------------------------------
-ensure_packages_master || {
-  c_warn "Package check failed — continue with CLP_SYNC_SKIP_APT=1 if tools exist"
-  ask_yn "Continue anyway?" "n" || exit 1
-}
+verify_master_tools || exit 1
 
-c_info "Master mode: CloudPanel data is only READ — sites/DBs/users are not modified."
-echo "  (Local sync state under /var/lib/clp-sync and temp dumps only.)"
+c_info "Master install: CloudPanel is READ-ONLY"
+echo "  Adds only: /opt/clp-sync, /etc/clp-sync, sync timer, SSH key to standby"
 echo
 
 echo "Online Tailscale peers:"

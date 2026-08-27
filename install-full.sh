@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # CloudPanel Hot Standby — full installer
 #
-# Clones (or updates) this repo and runs the interactive setup on THIS server.
+# NEVER runs apt-get. Safe on production CloudPanel master.
 #
 # One-liner (standby OR master):
 #   curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
 #
-# Or download and run:
-#   curl -fsSL -o install-full.sh https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh
-#   chmod +x install-full.sh && sudo ./install-full.sh
-#
-# Install order: STANDBY first, then MASTER.
+# Install order: STANDBY (2) first, then MASTER (1).
 set -euo pipefail
 
 REPO_URL="${CLP_SYNC_REPO:-https://github.com/supermaribo/cloudpanel-replication.git}"
@@ -31,70 +27,67 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-info "CloudPanel Hot Standby — full install"
+info "CloudPanel Hot Standby — full install (NO apt-get on CloudPanel)"
 echo "  Repo : ${REPO_URL}"
 echo "  Path : ${INSTALL_DIR}"
 echo
 
-# --- Prerequisites ----------------------------------------------------------
-info "Checking prerequisites..."
+# --- Prerequisites (verify only — never apt) --------------------------------
+info "Checking prerequisites (read-only — will not modify CloudPanel packages)..."
 
-export DEBIAN_FRONTEND=noninteractive
-need_pkg=()
-for pkg in git curl ca-certificates; do
-  dpkg -s "${pkg}" >/dev/null 2>&1 || need_pkg+=("${pkg}")
-done
-if ((${#need_pkg[@]})); then
-  if [[ "${CLP_SYNC_SKIP_APT:-0}" == "1" ]]; then
-    err "Missing packages: ${need_pkg[*]} — install manually or unset CLP_SYNC_SKIP_APT"
-    exit 1
-  fi
-  info "Installing: ${need_pkg[*]}"
-  apt-get update -y
-  apt-get install -y --no-install-recommends "${need_pkg[@]}"
+if ! command -v curl >/dev/null 2>&1; then
+  err "curl is required. Install curl manually before running this script."
+  exit 1
 fi
-ok "git, curl available"
+ok "curl available"
 
 if ! command -v tailscale >/dev/null 2>&1; then
-  err "Tailscale is not installed."
+  err "Tailscale not installed."
   echo "  Install: curl -fsSL https://tailscale.com/install.sh | sh && tailscale up"
   exit 1
 fi
 if ! tailscale ip -4 >/dev/null 2>&1; then
-  err "Tailscale is not connected. Run: tailscale up"
+  err "Tailscale not connected. Run: tailscale up"
   exit 1
 fi
 ok "Tailscale connected: $(tailscale ip -4 | head -1)"
 
 if ! command -v clpctl >/dev/null 2>&1; then
   err "CloudPanel not found (clpctl missing)."
-  echo "  Install CloudPanel first: https://www.cloudpanel.io/docs/v2/getting-started/"
   exit 1
 fi
 ok "CloudPanel detected"
 
-# --- Clone or update --------------------------------------------------------
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  info "Updating existing clone at ${INSTALL_DIR}"
-  git -C "${INSTALL_DIR}" fetch origin "${BRANCH}"
-  git -C "${INSTALL_DIR}" checkout "${BRANCH}"
-  git -C "${INSTALL_DIR}" pull origin "${BRANCH}" || true
+# --- Fetch source (git or tarball — no apt) ---------------------------------
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${ROOT}/lib/install-common.sh" ]]; then
+  # shellcheck source=lib/install-common.sh
+  source "${ROOT}/lib/install-common.sh"
+  # shellcheck source=lib/master-readonly.sh
+  source "${ROOT}/lib/master-readonly.sh"
+  fetch_repo_no_apt "${REPO_URL}" "${INSTALL_DIR}" "${BRANCH}"
 else
-  info "Cloning repository → ${INSTALL_DIR}"
+  # Running from curl pipe — bootstrap into INSTALL_DIR via tarball
+  info "Downloading source to ${INSTALL_DIR}"
+  command -v tar >/dev/null 2>&1 || { err "tar required"; exit 1; }
+  tmp="$(mktemp /var/tmp/clp-sync-dl.XXXXXX.tgz)"
+  curl -fsSL "https://github.com/supermaribo/cloudpanel-replication/archive/refs/heads/${BRANCH}.tar.gz" -o "${tmp}"
   rm -rf "${INSTALL_DIR}"
-  git clone --branch "${BRANCH}" --depth 1 "${REPO_URL}" "${INSTALL_DIR}"
+  mkdir -p "${INSTALL_DIR}"
+  tar xzf "${tmp}" -C "${INSTALL_DIR}" --strip-components=1
+  rm -f "${tmp}"
 fi
 ok "Source ready at ${INSTALL_DIR}"
 
 chmod +x "${INSTALL_DIR}/install-full.sh" "${INSTALL_DIR}/bin/"* 2>/dev/null || true
 
-# --- Interactive setup --------------------------------------------------------
 echo
 info "Starting interactive installer..."
 echo
 echo "  ┌─────────────────────────────────────────────────────────┐"
-echo "  │  STANDBY server  →  choose 2  (run this FIRST)          │"
-echo "  │  MASTER server   →  choose 1  (run AFTER standby)         │"
+echo "  │  STANDBY (new server)  →  type 2   (run FIRST)          │"
+echo "  │  MASTER (live sites)   →  type 1   (run AFTER standby)  │"
+echo "  │  Master: NO apt, NO CloudPanel changes — read-only sync  │"
 echo "  └─────────────────────────────────────────────────────────┘"
 echo
 

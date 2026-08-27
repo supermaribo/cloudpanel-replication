@@ -10,6 +10,8 @@ One-way **identical mirror** from a live CloudPanel **master** to a **hot standb
 
 **Standby first**, then **master**:
 
+**Master:** read-only — **zero** `apt-get`, **zero** `clpctl`, **zero** changes to nginx/MySQL/sites. See [master read-only policy](docs/master-readonly.md).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo bash
 ```
@@ -40,6 +42,7 @@ cd /root/clp-sync-src && sudo ./install-full.sh
 | [Installation](docs/installation.md) | Complete step-by-step |
 | [Command reference](docs/commands.md) | Every script and flag |
 | [Architecture](docs/architecture.md) | How sync works |
+| [Master read-only policy](docs/master-readonly.md) | **No CloudPanel changes on master** |
 | [Compatibility checks](docs/compatibility-checks.md) | Preflight validation |
 | [Operations](docs/operations.md) | Logs, timer, daily use |
 | [Failover](docs/failover.md) | `clp-promote` when master is lost |
