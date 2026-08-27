@@ -43,9 +43,9 @@ echo "============================================"
 echo "  CloudPanel Hot-Standby Sync Installer"
 echo "============================================"
 echo
-echo "Install this on BOTH servers. They link over Tailscale."
-echo "  • Master  = your live CloudPanel (source; sync is read-only here)"
-echo "  • Standby = empty/new CloudPanel (receives the mirror)"
+echo "Install on BOTH servers over Tailscale."
+echo "  • Master  = live CloudPanel (restricted SSH read key only — no timer)"
+echo "  • Standby = puller (rsync + mysqldump + local import)"
 echo
 
 if ! command -v tailscale >/dev/null 2>&1; then
@@ -112,180 +112,99 @@ if ! run_local_preflight "${ROLE}"; then
 fi
 
 # --------------------------------------------------------------------------
-# STANDBY
+# STANDBY — generates pull key, timer off until first successful sync
 # --------------------------------------------------------------------------
 if [[ "${ROLE}" == "standby" ]]; then
   verify_standby_tools || exit 1
-  write_config standby "" ""
 
-  TOKEN="$(generate_pair_token)"
-  echo "${TOKEN}" >/etc/clp-sync/pair.token
-  chmod 600 /etc/clp-sync/pair.token
-
-  # Do not enable sync timer on standby
-  systemctl disable --now clp-sync.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/clp-sync.timer /etc/systemd/system/clp-sync.service 2>/dev/null || true
-  systemctl daemon-reload 2>/dev/null || true
-
-  echo
-  echo "============================================"
-  echo "  STANDBY READY — pair from the master"
-  echo "============================================"
-  echo
-  echo "  Tailscale name : ${TS_NAME:-'(use IP)'}"
-  echo "  Tailscale IP   : ${TS_IP}"
-  echo "  Pairing token  : ${TOKEN}"
-  echo "  Pair port      : ${PAIR_PORT}"
-  echo
-  echo "On the MASTER, run the same installer, choose Master,"
-  echo "and enter this host + token when asked."
-  echo
-  echo "If the master is lost later, run on THIS server:"
-  echo "  /opt/clp-sync/bin/clp-promote"
-  echo
-  if ask_yn "Start pairing listener now (waits for master)?" "y"; then
-    echo
-    c_info "Waiting for master to pair (up to 30 minutes)..."
-    "${INSTALL_DEST}/bin/clp-pair-listen" --port "${PAIR_PORT}" --bind "${TS_IP}" --token "${TOKEN}"
-    c_ok "Standby paired. Leave this server alone until sync finishes on the master."
-  else
-    echo
-    echo "Start the listener later with:"
-    echo "  /opt/clp-sync/bin/clp-pair-listen --bind ${TS_IP}"
+  SSH_KEY=/root/.ssh/clp_sync_ed25519
+  if [[ ! -f "${SSH_KEY}" ]]; then
+    c_info "Generating pull key ${SSH_KEY}"
+    ssh-keygen -t ed25519 -f "${SSH_KEY}" -N '' -C "clp-sync-standby"
   fi
+  chmod 600 "${SSH_KEY}" "${SSH_KEY}.pub"
+
+  echo
+  echo "Online Tailscale peers (pick the live master):"
+  mapfile -t PEERS < <(tailscale_peers)
+  if ((${#PEERS[@]})); then
+    i=1
+    for line in "${PEERS[@]}"; do
+      name="${line%%$'\t'*}"
+      ip="${line#*$'\t'}"
+      printf "  %d) %s  (%s)\n" "${i}" "${name}" "${ip}"
+      i=$((i + 1))
+    done
+  else
+    c_warn "No online peers — enter master name/IP manually."
+  fi
+  ask "Master Tailscale name, 100.x IP, or peer number" ""
+  MASTER_HOST="${REPLY}"
+  [[ -n "${MASTER_HOST}" ]] || { c_err "Master host required"; exit 1; }
+  if [[ "${MASTER_HOST}" =~ ^[0-9]+$ ]] && ((${#PEERS[@]})) && [[ "${MASTER_HOST}" -ge 1 && "${MASTER_HOST}" -le ${#PEERS[@]} ]]; then
+    line="${PEERS[$((MASTER_HOST - 1))]}"
+    name="${line%%$'\t'*}"
+    ip="${line#*$'\t'}"
+    MASTER_HOST="${name:-${ip}}"
+  fi
+  c_ok "Master: ${MASTER_HOST}"
+
+  write_config standby "${MASTER_HOST}" "${SSH_KEY}"
+
+  install -m 644 "${INSTALL_DEST}/systemd/clp-sync.service" /etc/systemd/system/clp-sync.service
+  install -m 644 "${INSTALL_DEST}/systemd/clp-sync.timer" /etc/systemd/system/clp-sync.timer
+  systemctl daemon-reload
+  systemctl disable --now clp-sync.timer 2>/dev/null || true
+
+  echo
+  echo "============================================"
+  echo "  STANDBY PULL KEY — authorize on the master"
+  echo "============================================"
+  echo
+  echo "  Public key:"
+  echo
+  cat "${SSH_KEY}.pub"
+  echo
+  echo "On the MASTER run:"
+  echo "  sudo /opt/clp-sync/bin/clp-allow-pull '$(cat "${SSH_KEY}.pub")'"
+  echo
+  echo "Then on THIS standby:"
+  echo "  sudo /opt/clp-sync/bin/clp-sync --connect-only"
+  echo "  sudo /opt/clp-sync/bin/clp-sync"
+  echo
+  echo "Timer stays off until: sudo /opt/clp-sync/bin/clp-sync-control on"
+  echo
   exit 0
 fi
 
 # --------------------------------------------------------------------------
-# MASTER — never apt-get, never clpctl, never modify CloudPanel stack
+# MASTER — restricted SSH wrapper only (no timer, no dumps on disk)
 # --------------------------------------------------------------------------
 verify_master_tools || exit 1
 
 c_info "Master install: CloudPanel is READ-ONLY"
-echo "  Adds only: /opt/clp-sync, /etc/clp-sync, sync timer, SSH key to standby"
-echo
+echo "  Adds: /opt/clp-sync wrapper + optional pull key. No timer. No mysqldump files."
 
-echo "Online Tailscale peers:"
-mapfile -t PEERS < <(tailscale_peers)
-if ((${#PEERS[@]})); then
-  i=1
-  for line in "${PEERS[@]}"; do
-    name="${line%%$'\t'*}"
-    ip="${line#*$'\t'}"
-    printf "  %d) %s  (%s)\n" "${i}" "${name}" "${ip}"
-    i=$((i + 1))
-  done
-else
-  c_warn "No online peers listed — enter standby name/IP manually."
-fi
+write_config master "" ""
+systemctl disable --now clp-sync.timer 2>/dev/null || true
+rm -f /etc/systemd/system/clp-sync.timer /etc/systemd/system/clp-sync.service
+systemctl daemon-reload 2>/dev/null || true
+
+chmod 755 "${INSTALL_DEST}/bin/clp-master-read-only" "${INSTALL_DEST}/bin/clp-allow-pull"
 
 echo
-ask "Standby Tailscale name, 100.x IP, or peer number from list" ""
-STANDBY_HOST="${REPLY}"
-[[ -n "${STANDBY_HOST}" ]] || { c_err "Standby host required"; exit 1; }
-
-if [[ "${STANDBY_HOST}" =~ ^[0-9]+$ ]] && ((${#PEERS[@]})) && [[ "${STANDBY_HOST}" -ge 1 && "${STANDBY_HOST}" -le ${#PEERS[@]} ]]; then
-  line="${PEERS[$((STANDBY_HOST - 1))]}"
-  name="${line%%$'\t'*}"
-  ip="${line#*$'\t'}"
-  STANDBY_HOST="${name:-${ip}}"
-  c_ok "Selected peer: ${STANDBY_HOST}"
-fi
-
-ask "Pairing token (from standby installer)" ""
-PAIR_TOKEN="${REPLY}"
-[[ -n "${PAIR_TOKEN}" ]] || { c_err "Token required"; exit 1; }
-
-ask "Pairing port" "${PAIR_PORT}"
-PAIR_PORT="${REPLY}"
-
-SSH_KEY=/root/.ssh/clp_sync_ed25519
-if [[ ! -f "${SSH_KEY}" ]]; then
-  c_info "Generating SSH key ${SSH_KEY}"
-  ssh-keygen -t ed25519 -f "${SSH_KEY}" -N '' -C "clp-sync-master"
-fi
-PUBKEY="$(cat "${SSH_KEY}.pub")"
-
-c_info "Pairing with standby ${STANDBY_HOST}:${PAIR_PORT} ..."
-# Resolve bind: try host as-is
-PAIR_TARGET="${STANDBY_HOST}"
-python3 - <<PY
-import socket, sys
-host = "${PAIR_TARGET}"
-port = int("${PAIR_PORT}")
-token = """${PAIR_TOKEN}"""
-pubkey = """${PUBKEY}""".strip()
-payload = f"TOKEN={token}\nPUBKEY={pubkey}\n.\n".encode()
-s = socket.create_connection((host, port), timeout=20)
-s.sendall(payload)
-resp = s.recv(1024).decode("utf-8", "replace")
-s.close()
-print(resp.strip())
-if not resp.startswith("OK"):
-    sys.exit(1)
-PY
-c_ok "SSH key installed on standby"
-
-write_config master "${STANDBY_HOST}" "${SSH_KEY}"
-
-# Install systemd units on master only
-install -m 644 "${INSTALL_DEST}/systemd/clp-sync.service" /etc/systemd/system/clp-sync.service
-install -m 644 "${INSTALL_DEST}/systemd/clp-sync.timer" /etc/systemd/system/clp-sync.timer
-systemctl daemon-reload
-c_ok "systemd units installed"
-
-c_info "Testing SSH to standby..."
-if ! ssh -i "${SSH_KEY}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
-  "root@${STANDBY_HOST}" "echo ok && command -v clpctl"; then
-  c_err "SSH or clpctl check failed on standby"
-  exit 1
-fi
-c_ok "Standby reachable"
-
-c_info "Cross-host compatibility checks..."
-# shellcheck source=../lib/common.sh
-source "${ROOT}/lib/common.sh"
-# Populate remote() using config we just wrote
-load_config
-checks_reset
-if ! run_peer_compatibility master; then
-  c_err "Master ↔ standby compatibility checks failed."
-  if ! ask_yn "Continue with bootstrap anyway (not recommended)?" "n"; then
-    exit 1
-  fi
-fi
-
-echo
-if ask_yn "Run first full clone (bootstrap) now? This only writes to the standby." "y"; then
-  /opt/clp-sync/bin/clp-bootstrap
-fi
-
-echo
-if ask_yn "Enable 15-minute sync timer on this master?" "n"; then
-  if grep -q '^SYNC_AUTO=' /etc/clp-sync/config.env 2>/dev/null; then
-    sed -i 's/^SYNC_AUTO=.*/SYNC_AUTO=1/' /etc/clp-sync/config.env
-  else
-    echo 'SYNC_AUTO=1' >> /etc/clp-sync/config.env
-  fi
-  systemctl enable --now clp-sync.timer
-  c_ok "Timer enabled"
-  systemctl list-timers clp-sync.timer --no-pager || true
-else
-  systemctl disable --now clp-sync.timer 2>/dev/null || true
-  c_info "Timer left off — enable later with: /opt/clp-sync/bin/clp-sync-control on"
+if ask_yn "Paste the standby public key now (clp-allow-pull)?" "n"; then
+  ask "Standby public key line" ""
+  [[ -n "${REPLY}" ]] && "${INSTALL_DEST}/bin/clp-allow-pull" "${REPLY}"
 fi
 
 echo
 echo "============================================"
-echo "  MASTER SETUP COMPLETE"
+echo "  MASTER SOURCE READY"
 echo "============================================"
 echo
-echo "  Sync is read-only on this server."
-echo "  Status:  /opt/clp-sync/bin/clp-failover-check 30"
-echo "  Logs:    journalctl -u clp-sync.service -f"
-echo "  Manual:  /opt/clp-sync/bin/clp-sync"
-echo "  Docs:    https://github.com/supermaribo/cloudpanel-replication/tree/main/docs"
-echo "  Standby: curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash"
-echo "  Master:  curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash"
-echo "  Remove:  /opt/clp-sync/bin/uninstall.sh"
+echo "  This host does not run sync. The standby pulls over SSH."
+echo "  Authorize a key:  sudo /opt/clp-sync/bin/clp-allow-pull 'ssh-ed25519 AAAA…'"
+echo "  Remove:           sudo /opt/clp-sync/bin/uninstall.sh -y"
 echo
+exit 0

@@ -1,23 +1,41 @@
-# CloudPanel Hot Standby Sync
+# CloudPanel pull mirror
 
-One-way **identical mirror** from a live CloudPanel **master** to a **hot standby** over **Tailscale**. Install on **both** servers with one command; they pair automatically. Sync is **read-only on the master**.
+One-way **pull** from a live CloudPanel **master** to a **standby** over **Tailscale**. The standby does the work. The master only allows a **restricted SSH key** (rsync read + mysqldump stdout). No timer and no dump files on the live box.
 
 **Repository:** https://github.com/supermaribo/cloudpanel-replication
 
 ---
 
-## Install in one command
+## Install
 
-**Standby first**, then **master**. Set the role in the command so you never get stuck on “press 1 or 2”:
-
-**Master:** read-only — **zero** `apt-get`, **zero** `clpctl`, **zero** changes to nginx/MySQL/sites. See [master read-only policy](docs/master-readonly.md).
+**Master first** (restricted SSH wrapper only), then **standby** (puller).
 
 ```bash
-# Standby (empty CloudPanel) — run FIRST
-curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
-
-# Master (live CloudPanel) — run AFTER the standby listener is waiting
+# Master (live CloudPanel)
 curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=master bash
+
+# Standby (mirror) — prints a public key
+curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/main/install-full.sh | sudo CLP_SYNC_ROLE=standby bash
+```
+
+On the **master**, authorize the standby key:
+
+```bash
+sudo /opt/clp-sync/bin/clp-allow-pull 'ssh-ed25519 AAAA… clp-sync-standby'
+```
+
+On the **standby**:
+
+```bash
+sudo /opt/clp-sync/bin/clp-sync --connect-only
+sudo /opt/clp-sync/bin/clp-sync
+# later: sudo /opt/clp-sync/bin/clp-sync-control on
+```
+
+**Uninstall master** (does not touch CloudPanel or sites):
+
+```bash
+sudo /opt/clp-sync/bin/uninstall.sh -y
 ```
 
 If prompts still fail, download then run (uses a real terminal):
@@ -29,8 +47,8 @@ sudo bash /tmp/clp-install.sh
 
 | Server | Role |
 |--------|------|
-| Standby (new CloudPanel) | `CLP_SYNC_ROLE=standby` — save pairing token, leave listener running |
-| Master (live CloudPanel) | `CLP_SYNC_ROLE=master` — enter standby host + token, bootstrap + timer |
+| Master (live) | Restricted SSH key only — `clp-allow-pull` |
+| Standby (mirror) | Pulls files + dumps; runs `clp-sync` |
 
 Alternative (git clone):
 

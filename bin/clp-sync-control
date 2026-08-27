@@ -12,10 +12,10 @@ usage() {
   cat <<'EOF'
 Usage: clp-sync-control <on|off|status>
 
-Toggle outbound sync on the master (systemd timer).
+Toggle the 15-minute pull timer on the standby.
 
-  on      Enable the 15-minute sync timer
-  off     Disable the timer (manual clp-bootstrap / clp-sync still work)
+  on      Enable the timer
+  off     Disable (manual clp-sync still works)
   status  Show current setting
 EOF
 }
@@ -27,8 +27,8 @@ ACTION="${1:-status}"
 
 case "${ACTION}" in
   on|enable)
-    [[ "${ROLE:-master}" == "master" ]] || die "Only runs on master"
-    [[ -n "${STANDBY_HOST:-}" ]] || die "Set STANDBY_HOST first (clp-set-standby)"
+    [[ "${ROLE:-standby}" == "standby" ]] || die "Timer runs on the standby (puller)"
+    [[ -n "${MASTER_HOST:-}" ]] || die "Set MASTER_HOST first"
     toggle_sync on
     ;;
   off|disable)
@@ -42,7 +42,7 @@ case "${ACTION}" in
       echo "ROLE=${ROLE:-unknown}"
       echo "SYNC_ENABLED=${SYNC_ENABLED:-1}"
       echo "SYNC_AUTO=${SYNC_AUTO:-0}"
-      echo "STANDBY_HOST=${STANDBY_HOST:-}"
+      echo "MASTER_HOST=${MASTER_HOST:-}"
       echo "PROMOTED=${PROMOTED:-0}"
       [[ "${PROMOTED:-0}" == "1" ]] && grep ^PROMOTED_AT= "${cfg}" || true
       echo -n "timer="

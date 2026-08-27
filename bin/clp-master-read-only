@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Forced SSH command on the live master. Read-only: rsync sender, mysqldump
+# stdout, panel sqlite snapshot. Rejects everything else.
+set -euo pipefail
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+cmd="$(printf '%s' "${cmd}" | tr -d '\r')"
+
+allow_path() {
+  local p="$1"
+  p="${p#./}"
+  [[ "${p}" == /* ]] || return 1
+  [[ "${p}" != *..* ]] || return 1
+  case "${p}" in
+    /home/*|/etc/nginx|/etc/nginx/*|/etc/php|/etc/php/*|/etc/letsencrypt|/etc/letsencrypt/*|/var/lib/letsencrypt|/var/lib/letsencrypt/*|/etc/cron.d|/etc/cron.d/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+probe() {
+  echo "clp-sync-ok"
+  hostname -f 2>/dev/null || hostname
+  uname -m
+  df -Pk /home 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+panel_backup() {
+  local src="/home/clp/htdocs/app/data/db.sq3"
+  local tmp
+  [[ -f "${src}" ]] || { echo "no panel db" >&2; exit 1; }
+  tmp="$(mktemp /var/tmp/clp-panel.XXXXXX.sq3)"
+  trap 'rm -f "${tmp}"' EXIT
+  sqlite3 "${src}" ".backup '${tmp}'"
+  cat "${tmp}"
+}
+
+dump_db() {
+  local db="$1"
+  db="$(printf '%s' "${db}" | tr -d '[:space:]')"
+  [[ "${db}" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad database name" >&2; exit 1; }
+  case ",${db}," in
+    *,information_schema,*|*,performance_schema,*|*,sys,*|*,mysql,*)
+      echo "refusing system database" >&2
+      exit 1
+      ;;
+  esac
+  exec mysqldump --single-transaction --quick --routines --triggers \
+    --skip-dump-date --set-gtid-purged=OFF --default-character-set=utf8mb4 \
+    --no-tablespaces --databases "${db}"
+}
+
+# rsync --server --sender … <path>
+if [[ "${cmd}" == rsync\ --server\ --sender* ]]; then
+  path="${cmd##* }"
+  path="${path%/}"
+  [[ -n "${path}" ]] || { echo "rsync path missing" >&2; exit 1; }
+  if ! allow_path "${path}" && ! allow_path "${path}/"; then
+    echo "rsync path not allowed: ${path}" >&2
+    exit 1
+  fi
+  set -f
+  eval "exec ${cmd}"
+fi
+
+if [[ "${cmd}" == rsync\ --server* ]]; then
+  echo "rsync receive (write) is not allowed on master" >&2
+  exit 1
+fi
+
+case "${cmd}" in
+  clp-sync-probe) probe; exit 0 ;;
+  clp-panel-backup) panel_backup; exit 0 ;;
+  clp-mysqldump\ *)
+    dump_db "${cmd#clp-mysqldump }"
+    ;;
+  "")
+    echo "clp-master-read-only: no command (restricted key)" >&2
+    exit 1
+    ;;
+  *)
+    echo "clp-master-read-only: refused: ${cmd}" >&2
+    exit 1
+    ;;
+esac

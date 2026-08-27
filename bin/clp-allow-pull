@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Install the standby pull key on this master (restricted, read-only).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WRAPPER="${ROOT}/bin/clp-master-read-only"
+AUTH=/root/.ssh/authorized_keys
+MARKER="clp-sync-standby"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run as root: sudo $0" >&2
+  exit 1
+fi
+[[ -x "${WRAPPER}" ]] || { echo "Missing ${WRAPPER}" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  clp-allow-pull 'ssh-ed25519 AAAA… comment'
+  clp-allow-pull /path/to/id.pub
+  clp-allow-pull -          # read pubkey from stdin
+
+Adds a restricted authorized_keys entry. The standby can only rsync-read,
+mysqldump to stdout, and snapshot the panel sqlite. No writes on this host.
+EOF
+}
+
+KEY=""
+if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+if [[ "$1" == "-" ]]; then
+  KEY="$(tr -d '\r' | head -1)"
+elif [[ -f "$1" ]]; then
+  KEY="$(head -1 "$1")"
+else
+  KEY="$*"
+fi
+KEY="$(printf '%s' "${KEY}" | tr -s ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+if [[ ! "${KEY}" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|sk-ssh-ed25519@openssh.com)\  ]]; then
+  echo "Not a public key line" >&2
+  exit 1
+fi
+
+type="${KEY%% *}"
+rest="${KEY#* }"
+blob="${rest%% *}"
+[[ -n "${blob}" ]] || { echo "Malformed public key" >&2; exit 1; }
+
+opts="command=\"${WRAPPER}\",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty,no-user-rc"
+line="${opts} ${type} ${blob} ${MARKER}"
+
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+touch "${AUTH}"
+chmod 600 "${AUTH}"
+
+tmp="$(mktemp)"
+grep -v "${MARKER}" "${AUTH}" >"${tmp}" || true
+printf '%s\n' "${line}" >>"${tmp}"
+mv "${tmp}" "${AUTH}"
+chmod 600 "${AUTH}"
+
+echo "OK restricted pull key installed (${MARKER})"
+echo "Standby can now: ssh -i <key> root@$(hostname -f 2>/dev/null || hostname) clp-sync-probe"

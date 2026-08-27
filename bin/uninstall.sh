@@ -103,6 +103,16 @@ if [[ "${ROLE}" == "standby" && -f /root/.ssh/authorized_keys ]]; then
   fi
 fi
 
+# Master: remove restricted standby pull key
+if [[ "${ROLE}" == "master" && -f /root/.ssh/authorized_keys ]]; then
+  if grep -q 'clp-sync-standby' /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "==> Removing clp-sync-standby pull key from /root/.ssh/authorized_keys..."
+    grep -v 'clp-sync-standby' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true
+    mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+  fi
+fi
+
 # Master: optional SSH key removal
 if [[ "${ROLE}" == "master" && "${KEEP_SSH_KEY}" -eq 0 ]]; then
   if [[ -f /root/.ssh/clp_sync_ed25519 ]]; then

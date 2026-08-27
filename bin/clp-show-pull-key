@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Print the standby pull public key (for clp-allow-pull on the master).
+set -euo pipefail
+
+KEY="${CLP_PULL_KEY:-/root/.ssh/clp_sync_ed25519}"
+if [[ ! -f "${KEY}.pub" ]]; then
+  echo "No pull key at ${KEY}.pub — run the standby installer first" >&2
+  exit 1
+fi
+cat "${KEY}.pub"
+echo
+echo "On the MASTER run:"
+echo "  sudo /opt/clp-sync/bin/clp-allow-pull '$(cat "${KEY}.pub")'"

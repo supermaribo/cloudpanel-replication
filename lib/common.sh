@@ -28,7 +28,7 @@ die() {
 }
 
 require_root() {
-  [[ "$(id -u)" -eq 0 ]] || die "Must run as root on the primary server"
+  [[ "$(id -u)" -eq 0 ]] || die "Must run as root"
 }
 
 load_config() {
@@ -44,7 +44,11 @@ load_config() {
   # shellcheck disable=SC1090
   set -a; source "${cfg}"; set +a
 
-  : "${ROLE:=master}"
+  : "${ROLE:=standby}"
+  : "${MASTER_HOST:=${PRIMARY_HOST:-}}"
+  : "${MASTER_SSH_USER:=root}"
+  : "${MASTER_SSH_PORT:=22}"
+  : "${MASTER_SSH_KEY:=/root/.ssh/clp_sync_ed25519}"
   : "${STANDBY_SSH_USER:=root}"
   : "${STANDBY_SSH_PORT:=22}"
   : "${CLP_DB_PATH:=/home/clp/htdocs/app/data/db.sq3}"
@@ -68,10 +72,8 @@ load_config() {
   : "${FORMER_PRIMARY_HOST:=}"
   : "${PROMOTED_AT:=}"
 
-  if [[ "${ROLE}" == "standby" ]]; then
-    : # standby does not need STANDBY_HOST
-  elif [[ "${ROLE}" == "master" && "${SYNC_ENABLED}" == "1" && -z "${STANDBY_HOST}" ]]; then
-    die "STANDBY_HOST required for ROLE=master with SYNC_ENABLED=1 (or run clp-set-standby / clp-sync-control off)"
+  if [[ "${ROLE}" == "standby" && "${SYNC_ENABLED}" == "1" && -z "${MASTER_HOST}" ]]; then
+    die "MASTER_HOST required for ROLE=standby (the live CloudPanel to pull from)"
   fi
 
   mkdir -p "${CLP_SYNC_STATE_DIR}" "${CLP_SYNC_TMP_DIR}" "${CLP_SYNC_LOG_DIR}"
@@ -79,49 +81,88 @@ load_config() {
 }
 
 ssh_opts() {
-  SSH_OPTS=(-p "${STANDBY_SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
-  if [[ -n "${STANDBY_SSH_KEY:-}" ]]; then
-    SSH_OPTS+=(-i "${STANDBY_SSH_KEY}")
+  local port="${MASTER_SSH_PORT:-${STANDBY_SSH_PORT:-22}}"
+  local key="${MASTER_SSH_KEY:-${STANDBY_SSH_KEY:-}}"
+  SSH_OPTS=(-p "${port}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+  if [[ -n "${key}" && -f "${key}" ]]; then
+    SSH_OPTS+=(-i "${key}")
   fi
 }
 
-standby_target() {
-  echo "${STANDBY_SSH_USER}@${STANDBY_HOST}"
+master_target() {
+  echo "${MASTER_SSH_USER}@${MASTER_HOST}"
 }
 
-# Quote one argument for the remote bash -c string (spaces, (), $, quotes).
-ssh_quote() {
-  printf '%q' "$1"
-}
-
-# Run a command on the standby.
-# One argument  = remote shell snippet (may contain &&, quotes, redirects).
-# Several args  = argv (each token is quoted so spaces/() in vhost templates
-#                 and passwords cannot break the remote shell).
-remote() {
-  local SSH_OPTS remote_cmd="" arg
+# SSH to the live master (restricted key). One arg = remote command string.
+master_ssh() {
+  local SSH_OPTS
   ssh_opts
-  if [[ $# -eq 1 ]]; then
-    ssh "${SSH_OPTS[@]}" "$(standby_target)" "$1"
-    return
-  fi
-  for arg in "$@"; do
-    remote_cmd+="$(ssh_quote "${arg}") "
-  done
-  ssh "${SSH_OPTS[@]}" "$(standby_target)" "${remote_cmd}"
-}
-
-remote_bash() {
-  remote bash -s
+  ssh "${SSH_OPTS[@]}" "$(master_target)" "$1"
 }
 
 rsync_ssh_cmd() {
-  local cmd="ssh -p ${STANDBY_SSH_PORT} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
-  if [[ -n "${STANDBY_SSH_KEY:-}" ]]; then
-    cmd+=" -i ${STANDBY_SSH_KEY}"
+  local port="${MASTER_SSH_PORT:-22}"
+  local key="${MASTER_SSH_KEY:-/root/.ssh/clp_sync_ed25519}"
+  local cmd="ssh -p ${port} -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+  if [[ -n "${key}" && -f "${key}" ]]; then
+    cmd+=" -i ${key}"
   fi
   echo "${cmd}"
 }
+
+# Pull path from master → local dest. Extra rsync args after dest.
+rsync_from_master() {
+  local src="$1"
+  local dest="$2"
+  shift 2
+  local rsync_ssh item_log n rc=0
+  rsync_ssh="$(rsync_ssh_cmd)"
+  item_log="${CLP_SYNC_TMP_DIR}/rsync-item.$$"
+  mkdir -p "${CLP_SYNC_TMP_DIR}" "$(dirname "${dest}")"
+  RSYNC_CHANGED=0
+
+  rsync -aHAX --delete --omit-dir-times \
+    --out-format='%i %n%L' \
+    -e "${rsync_ssh}" \
+    "$@" \
+    "$(master_target):${src}" "${dest}" >"${item_log}" || rc=$?
+
+  if [[ "${rc}" -ne 0 ]]; then
+    rm -f "${item_log}"
+    log_error "rsync pull failed (rc=${rc}): ${src} → ${dest}"
+    return 1
+  fi
+
+  n="$(grep -cE '^[<>c*h]|^\.[fL]' "${item_log}" 2>/dev/null || true)"
+  n="${n:-0}"
+  rm -f "${item_log}"
+  if [[ "${n}" -gt 0 ]]; then
+    INC_FILE_CHANGES=$((INC_FILE_CHANGES + n))
+    RSYNC_CHANGED=1
+    log_info "pull ${src} (${n} change(s))"
+    return 0
+  fi
+  INC_SKIPPED=$((INC_SKIPPED + 1))
+  log_info "pull ${src}: unchanged"
+  return 0
+}
+
+write_status() {
+  local status="$1"
+  local detail="${2:-}"
+  local f="${CLP_SYNC_STATE_DIR}/last-status"
+  {
+    echo "status=${status}"
+    echo "finished_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "hostname=$(hostname -f 2>/dev/null || hostname)"
+    echo "master=${MASTER_HOST}"
+    [[ -n "${detail}" ]] && echo "detail=${detail}"
+  } >"${f}"
+  chmod 600 "${f}"
+}
+
+# shellcheck source=incremental.sh
+source "${CLP_SYNC_ROOT}/lib/incremental.sh"
 
 require_cmds() {
   local missing=()
@@ -149,27 +190,7 @@ sql_escape() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
 
-# Returns 0 if type is in BOOTSTRAP_SITE_TYPES
 site_type_allowed() {
   local t="$1"
   [[ ",${BOOTSTRAP_SITE_TYPES}," == *",${t},"* ]]
 }
-
-write_status() {
-  local status="$1"
-  local detail="${2:-}"
-  local f="${CLP_SYNC_STATE_DIR}/last-status"
-  {
-    echo "status=${status}"
-    echo "finished_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    echo "hostname=$(hostname -f 2>/dev/null || hostname)"
-    echo "standby=${STANDBY_HOST}"
-    [[ -n "${detail}" ]] && echo "detail=${detail}"
-  } >"${f}"
-  chmod 600 "${f}"
-}
-
-# shellcheck source=mysql-auth.sh
-source "${CLP_SYNC_ROOT}/lib/mysql-auth.sh"
-# shellcheck source=incremental.sh
-source "${CLP_SYNC_ROOT}/lib/incremental.sh"

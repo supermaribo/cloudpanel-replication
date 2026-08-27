@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# clp-sync — orchestrate primary → standby identical hot-standby mirror.
+# clp-sync — standby pull mirror from the live master.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,57 +7,34 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/lib/common.sh"
 # shellcheck source=../lib/inventory.sh
 source "${ROOT}/lib/inventory.sh"
-# shellcheck source=../lib/sync-bootstrap.sh
-source "${ROOT}/lib/sync-bootstrap.sh"
-# shellcheck source=../lib/sync-files.sh
-source "${ROOT}/lib/sync-files.sh"
-# shellcheck source=../lib/sync-mysql.sh
-source "${ROOT}/lib/sync-mysql.sh"
-# shellcheck source=../lib/sync-nginx-ssl.sh
-source "${ROOT}/lib/sync-nginx-ssl.sh"
-# shellcheck source=../lib/sync-panel-meta.sh
-source "${ROOT}/lib/sync-panel-meta.sh"
-# shellcheck source=../lib/sync-users.sh
-source "${ROOT}/lib/sync-users.sh"
-# shellcheck source=../lib/checks.sh
-source "${ROOT}/lib/checks.sh"
+# shellcheck source=../lib/pull.sh
+source "${ROOT}/lib/pull.sh"
 
-SKIP_BOOTSTRAP=0
 SKIP_FILES=0
 SKIP_MYSQL=0
 SKIP_NGINX=0
-SKIP_USERS=0
-SKIP_CHECKS=0
 DRY_CONNECT_ONLY=0
 
 usage() {
   cat <<'EOF'
 Usage: clp-sync [options]
 
-  Identical hot-standby mirror: this CloudPanel primary → STANDBY_HOST (Tailscale).
-  Syncs sites, files, SSH keys, SSL/Let's Encrypt certs, users/passwords,
-  MySQL, nginx, PHP-FPM, crons, FTP users, and CloudPanel panel DB.
+  Pull mirror: this standby fetches from MASTER_HOST over a read-only SSH key.
 
 Options:
-  --skip-bootstrap   Do not create missing sites/DBs on standby
-  --skip-files       Skip rsync of /home/<siteUser>
-  --skip-mysql       Skip MySQL dump/import
-  --skip-nginx       Skip nginx/SSL/PHP-FPM/cron sync
-  --skip-users       Skip Linux password/SSH identity + FTP provisioning
-  --skip-checks      Skip pre-sync compatibility checks
-  --connect-only     Only test SSH to standby, then exit
-  -h, --help         Show help
+  --skip-files     Skip rsync of site homes
+  --skip-mysql     Skip MySQL dump/import
+  --skip-nginx     Skip nginx/PHP pull
+  --connect-only   Probe master SSH, then exit
+  -h, --help
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --skip-bootstrap) SKIP_BOOTSTRAP=1 ;;
     --skip-files) SKIP_FILES=1 ;;
     --skip-mysql) SKIP_MYSQL=1 ;;
     --skip-nginx) SKIP_NGINX=1 ;;
-    --skip-users) SKIP_USERS=1 ;;
-    --skip-checks) SKIP_CHECKS=1 ;;
     --connect-only) DRY_CONNECT_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
@@ -68,28 +45,16 @@ done
 require_root
 load_config
 
-if [[ "${ROLE:-master}" == "standby" ]]; then
-  die "This host is ROLE=standby — run sync only on the master (or clp-promote after primary loss)"
-fi
+[[ "${ROLE}" == "standby" ]] || die "clp-sync now runs on the standby (ROLE=standby). Master only allows a restricted SSH key."
 
-# systemd timer / systemctl start: no-op until SYNC_AUTO=1.
-# Manual `/opt/clp-sync/bin/clp-sync` and clp-bootstrap still run.
 if [[ -n "${INVOCATION_ID:-}" && "${SYNC_AUTO:-0}" != "1" ]]; then
-  echo "clp-sync: automatic sync is off (SYNC_AUTO=0) — scheduled run skipped"
-  echo "Enable later with: /opt/clp-sync/bin/clp-sync-control on"
+  echo "clp-sync: automatic sync is off (SYNC_AUTO=0)"
+  echo "Enable with: /opt/clp-sync/bin/clp-sync-control on"
   exit 0
 fi
 
-if [[ "${SYNC_ENABLED:-1}" != "1" ]]; then
-  die "Sync is disabled (SYNC_ENABLED=0). Enable with: clp-sync-control on  or configure standby: clp-set-standby"
-fi
-
-if [[ -z "${STANDBY_HOST:-}" ]]; then
-  die "No STANDBY_HOST configured — run clp-set-standby"
-fi
-
-: "${APPLY_PANEL_DB:=1}"
-: "${SYNC_EXTRA_USERS:=clp}"
+[[ "${SYNC_ENABLED:-1}" == "1" ]] || die "SYNC_ENABLED=0"
+[[ -n "${MASTER_HOST:-}" ]] || die "MASTER_HOST is not set"
 
 CLP_SYNC_LOG_FILE="${CLP_SYNC_LOG_DIR}/sync-$(date -u +%Y%m%d).log"
 touch "${CLP_SYNC_LOG_FILE}"
@@ -104,21 +69,10 @@ fi
 START_TS="$(date +%s)"
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
 
-require_cmds ssh rsync sqlite3 flock openssl
-log_info "clp-sync starting (incremental) → ${STANDBY_HOST}"
+require_cmds ssh rsync sqlite3 flock timeout mysql
+log_info "clp-sync pull ← ${MASTER_HOST}"
 
-if [[ "${SKIP_CHECKS}" -eq 0 ]]; then
-  log_info "Running pre-sync compatibility checks"
-  if ! run_sync_preflight; then
-    die "Preflight checks failed (use --skip-checks to override)"
-  fi
-else
-  log_warn "Skipping pre-sync checks (--skip-checks)"
-  log_info "Testing SSH to standby"
-  if ! remote "echo ok && command -v clpctl && command -v sqlite3 && command -v nginx"; then
-    die "Cannot reach standby or missing clpctl/sqlite3/nginx"
-  fi
-fi
+pull_probe || die "Cannot reach master (install pull key with clp-allow-pull)"
 
 if [[ "${DRY_CONNECT_ONLY}" -eq 1 ]]; then
   log_ok "Connectivity OK"
@@ -127,57 +81,33 @@ if [[ "${DRY_CONNECT_ONLY}" -eq 1 ]]; then
   exit 0
 fi
 
-DB_SNAP="$(inventory_snapshot)"
+DB_SNAP="$(pull_panel_sqlite)"
 log_info "Inventory snapshot: ${DB_SNAP}"
 
-if [[ "${SKIP_BOOTSTRAP}" -eq 0 ]]; then
-  run_bootstrap "${DB_SNAP}"
-fi
-
-# Panel accounts immediately so "Admin User Creation" is cleared even if a
-# later step (MySQL import) fails.
-if [[ "${APPLY_PANEL_DB:-1}" == "1" ]]; then
-  sync_panel_accounts "${DB_SNAP}"
-  ensure_inventory_linux_users "${DB_SNAP}"
-fi
-
-if [[ "${SKIP_USERS}" -eq 0 ]]; then
-  log_info "Step 2/5: Users, FTP, SSH"
-  sync_ftp_users "${DB_SNAP}"
-fi
+ensure_linux_users "${DB_SNAP}"
+pull_app_secret
 
 if [[ "${SKIP_FILES}" -eq 0 ]]; then
-  log_info "Step 3/5: Site files"
-  sync_site_files "${DB_SNAP}"
-fi
-
-if [[ "${SKIP_USERS}" -eq 0 ]]; then
-  # After files (.ssh) land, apply identical password hashes + key perms
-  sync_user_identities "${DB_SNAP}"
+  pull_site_files "${DB_SNAP}"
 fi
 
 if [[ "${SKIP_NGINX}" -eq 0 ]]; then
-  log_info "Step 4/5: Nginx, SSL, PHP-FPM, crons"
-  ensure_inventory_linux_users "${DB_SNAP}"
-  sync_nginx_ssl
-  sync_php_fpm_pools
-  sync_crons "${DB_SNAP}"
-  disable_standby_backups
-  disable_standby_cloud_images
+  pull_nginx_php
 fi
+
+apply_panel_db_local "${DB_SNAP}"
+disable_local_backup_jobs
 
 if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
-  sync_mysql "${DB_SNAP}"
+  pull_and_import_mysql "${DB_SNAP}"
 fi
 
-log_info "Refreshing CloudPanel panel sqlite after data sync"
-sync_panel_meta "${DB_SNAP}"
-disable_standby_backups
-disable_standby_cloud_images
+apply_panel_db_local "${DB_SNAP}"
+disable_local_backup_jobs
 
 DURATION="$(( $(date +%s) - START_TS ))"
 write_status ok "duration_s=${DURATION}"
 log_incremental_summary
-log_ok "clp-sync finished (incremental) in ${DURATION}s"
+log_ok "clp-sync pull finished in ${DURATION}s"
 trap - EXIT
 exit 0
