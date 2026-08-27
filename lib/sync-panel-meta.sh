@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
 # Apply CloudPanel SQLite so panel UI users, sites, FTP, SSL metadata match primary.
 
-CLP_APP_ENV="${CLP_APP_ENV:-/home/clp/htdocs/app/.env}"
+CLP_APP_ENV="${CLP_APP_ENV:-}"
+
+_find_app_env_file() {
+  local f
+  if [[ -n "${CLP_APP_ENV}" && -f "${CLP_APP_ENV}" ]]; then
+    echo "${CLP_APP_ENV}"
+    return 0
+  fi
+  for f in \
+    /home/clp/htdocs/app/.env \
+    /home/clp/htdocs/app/.env.local \
+    /home/clp/htdocs/app/.env.prod.local \
+    /home/clp/.env
+  do
+    if [[ -f "${f}" ]] && grep -q '^APP_SECRET=' "${f}"; then
+      echo "${f}"
+      return 0
+    fi
+  done
+  while IFS= read -r f; do
+    if grep -q '^APP_SECRET=' "${f}"; then
+      echo "${f}"
+      return 0
+    fi
+  done < <(find /home/clp/htdocs/app -maxdepth 3 -name '.env*' -type f 2>/dev/null | head -20)
+  return 1
+}
 
 # Standby must use the same APP_SECRET as master or copied panel passwords
-# (admin login, encrypted DB users) will not decrypt and the UI stays on
-# "Admin User Creation" if the sqlite copy never lands.
+# (admin login, encrypted DB users) will not decrypt.
 sync_panel_app_secret() {
-  local env_file="${CLP_APP_ENV}"
-  local secret
-  if [[ ! -f "${env_file}" ]]; then
-    log_warn "Master ${env_file} missing — cannot align APP_SECRET"
+  local env_file secret
+  env_file="$(_find_app_env_file || true)"
+  if [[ -z "${env_file}" ]]; then
+    log_warn "No APP_SECRET file found under /home/clp — admin login may need a password reset after failover"
     return 0
   fi
   secret="$(python3 - "${env_file}" <<'PY'
@@ -28,12 +53,21 @@ PY
   fi
   remote bash -s -- "${env_file}" "${secret}" <<'EOS'
 set -euo pipefail
-python3 - "$1" "$2" <<'PY'
+written="$(python3 - "$1" "$2" <<'PY'
 import pathlib, re, sys
-path = pathlib.Path(sys.argv[1])
+wanted = pathlib.Path(sys.argv[1])
 secret = sys.argv[2]
-if not path.is_file():
-    sys.exit("standby .env missing: " + str(path))
+candidates = [wanted] + [
+    pathlib.Path(p) for p in (
+        "/home/clp/htdocs/app/.env",
+        "/home/clp/htdocs/app/.env.local",
+        "/home/clp/htdocs/app/.env.prod.local",
+        "/home/clp/.env",
+    )
+]
+path = next((p for p in candidates if p.is_file()), None)
+if path is None:
+    sys.exit("standby .env missing")
 text = path.read_text(errors="replace")
 line = "APP_SECRET=" + secret
 if re.search(r"^APP_SECRET=", text, re.M):
@@ -43,11 +77,13 @@ else:
         text += "\n"
     text += line + "\n"
 path.write_text(text)
+print(str(path))
 PY
-chown clp:clp "$1" 2>/dev/null || true
-chmod 640 "$1" 2>/dev/null || true
+)"
+chown clp:clp "${written}" 2>/dev/null || true
+chmod 640 "${written}" 2>/dev/null || true
 EOS
-  log_ok "Standby CloudPanel APP_SECRET matches master"
+  log_ok "Standby CloudPanel APP_SECRET matches master (${env_file})"
 }
 
 _standby_panel_user_summary() {
@@ -155,4 +191,128 @@ sync_panel_accounts() {
   sync_panel_app_secret
   sync_panel_data_files
   sync_panel_meta "$1"
+  disable_standby_backups
+}
+
+# Keep backup destinations/credentials in the panel DB and rclone configs.
+# Only stop the jobs from running on the standby (master already backs up).
+disable_standby_backups() {
+  log_info "Disabling CloudPanel backup jobs on standby (credentials kept)"
+  remote bash -s <<'EOS'
+set -euo pipefail
+python3 - <<'PY'
+import pathlib, re
+
+MARKER = "# clp-sync: backups disabled on standby — credentials/settings kept; re-enable on promote\n"
+JOB_RE = re.compile(r"db:backup|remote-backup|\brclone\b", re.I)
+
+def disable(path: pathlib.Path) -> bool:
+    if not path.is_file():
+        return False
+    text = path.read_text(errors="replace")
+    lines = text.splitlines(True)
+    out = []
+    if not any("clp-sync: backups disabled on standby" in ln for ln in lines):
+        out.append(MARKER)
+    changed = False
+    for line in lines:
+        raw = line.rstrip("\n")
+        if "clp-sync: backups disabled on standby" in raw:
+            continue
+        stripped = raw.lstrip()
+        if stripped.startswith("#") or not stripped:
+            out.append(line if line.endswith("\n") else line + "\n")
+            continue
+        if JOB_RE.search(stripped):
+            out.append("# clp-sync-disabled: " + stripped + "\n")
+            changed = True
+        else:
+            out.append(line if line.endswith("\n") else line + "\n")
+    new = "".join(out)
+    if new != text:
+        path.write_text(new)
+        return True
+    return changed
+
+changed = False
+for p in (
+    pathlib.Path("/etc/cron.d/clp"),
+    pathlib.Path("/etc/cron.d/clp-rclone"),
+    pathlib.Path("/etc/cron.d/clp-remote-backup"),
+):
+    try:
+        if disable(p):
+            print("disabled jobs in", p)
+            changed = True
+    except OSError as e:
+        print("skip", p, e)
+
+# crontab of clp / clp-admin if they have backup lines
+import os, subprocess, tempfile
+for user in ("clp", "clp-admin"):
+    try:
+        current = subprocess.check_output(["crontab", "-u", user, "-l"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        continue
+    lines = current.splitlines()
+    new_lines = []
+    job_changed = False
+    for raw in lines:
+        stripped = raw.lstrip()
+        if stripped.startswith("#") or not stripped:
+            new_lines.append(raw)
+            continue
+        if JOB_RE.search(stripped) and not raw.startswith("# clp-sync-disabled:"):
+            new_lines.append("# clp-sync-disabled: " + stripped)
+            job_changed = True
+        else:
+            new_lines.append(raw)
+    if job_changed:
+        body = "\n".join(new_lines) + "\n"
+        if "clp-sync: backups disabled on standby" not in body:
+            body = MARKER + body
+        subprocess.run(["crontab", "-u", user, "-"], input=body, text=True, check=True)
+        print("disabled backup crontab for", user)
+        changed = True
+
+if not changed:
+    print("no active backup jobs to disable")
+PY
+EOS
+  log_ok "Standby backup jobs disabled (S3/local credentials unchanged)"
+}
+
+enable_standby_backups() {
+  log_info "Re-enabling CloudPanel backup jobs (promotion)"
+  python3 - <<'PY'
+import pathlib, re, subprocess
+prefix = re.compile(r"^# clp-sync-disabled:\s*")
+for p in (
+    pathlib.Path("/etc/cron.d/clp"),
+    pathlib.Path("/etc/cron.d/clp-rclone"),
+    pathlib.Path("/etc/cron.d/clp-remote-backup"),
+):
+    if not p.is_file():
+        continue
+    lines = []
+    for line in p.read_text(errors="replace").splitlines():
+        if "clp-sync: backups disabled on standby" in line:
+            continue
+        lines.append(prefix.sub("", line))
+    p.write_text("\n".join(lines) + ("\n" if lines else ""))
+    print("restored", p)
+for user in ("clp", "clp-admin"):
+    try:
+        current = subprocess.check_output(["crontab", "-u", user, "-l"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        continue
+    lines = []
+    for line in current.splitlines():
+        if "clp-sync: backups disabled on standby" in line:
+            continue
+        lines.append(prefix.sub("", line))
+    body = "\n".join(lines) + "\n"
+    subprocess.run(["crontab", "-u", user, "-"], input=body, text=True, check=True)
+    print("restored crontab for", user)
+PY
 }

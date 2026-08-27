@@ -162,6 +162,10 @@ promote_standby_to_master() {
   config_set_kv "STANDBY_HOST" ""
   set_role "master"
 
+  # shellcheck source=sync-panel-meta.sh
+  source "${CLP_SYNC_ROOT}/lib/sync-panel-meta.sh"
+  enable_standby_backups || true
+
   install_master_systemd
   systemctl disable --now clp-sync.timer 2>/dev/null || true
 

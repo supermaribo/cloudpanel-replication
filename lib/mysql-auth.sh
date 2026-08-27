@@ -71,13 +71,14 @@ ensure_mysql_defaults() {
 [client]
 user=${user}
 password=${pass}
-host=${host}
+host=127.0.0.1
 port=${port}
+protocol=tcp
 EOF
     chmod 600 "${cnf}"
-    if mysql --defaults-extra-file="${cnf}" --batch -N -e "SELECT 1" >/dev/null 2>&1; then
+    if mysql --defaults-extra-file="${cnf}" -h 127.0.0.1 --protocol=TCP --batch -N -e "SELECT 1" >/dev/null 2>&1; then
       MYSQL_DEFAULTS_FILE="${cnf}"
-      log_info "MySQL client using CloudPanel master credentials (${user}@${host})"
+      log_info "MySQL client using CloudPanel master credentials (${user}@127.0.0.1)"
       return 0
     fi
   fi
@@ -131,9 +132,8 @@ def mysql_cmd():
         timeout=30,
         text=True,
     )
-    user = grab(out, "User Name", "UserName", "Username", "User") or "root"
+    user = grab(out, "User Name", "UserName", "Username") or "root"
     password = grab(out, "Password")
-    host = grab(out, "Host") or "127.0.0.1"
     port = grab(out, "Port") or "3306"
     m = re.search(r"-p'([^']+)'", out)
     if m:
@@ -143,8 +143,22 @@ def mysql_cmd():
     fd, cnf = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
     os.chmod(cnf, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(f"[client]\nuser={user}\npassword={password}\nhost={host}\nport={port}\nconnect-timeout=10\n")
-    return ["mysql", f"--defaults-extra-file={cnf}", "--batch", "--raw", "--quick"], cnf
+        f.write(
+            "[client]\n"
+            f"user={user}\n"
+            f"password={password}\n"
+            "host=127.0.0.1\n"
+            f"port={port}\n"
+            "protocol=tcp\n"
+            "connect-timeout=10\n"
+        )
+    return [
+        "mysql",
+        f"--defaults-extra-file={cnf}",
+        "-h", "127.0.0.1",
+        "--protocol=TCP",
+        "--batch", "--raw", "--quick",
+    ], cnf
 
 cmd, cnf = mysql_cmd()
 try:

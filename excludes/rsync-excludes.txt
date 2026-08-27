@@ -12,5 +12,6 @@ tmp/
 **/storage/logs/
 **/node_modules/.cache/
 *.log
+backups/
 backups/*.sql.gz
 .DS_Store
