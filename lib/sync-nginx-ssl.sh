@@ -34,6 +34,14 @@ sync_nginx_ssl() {
   fi
 
   if [[ "${RELOAD_NGINX_ON_STANDBY}" == "1" && "${changed}" -eq 1 ]]; then
+    log_info "Ensuring nginx log directories exist on standby"
+    remote 'for u in /home/*; do
+      [[ -d "$u" ]] || continue
+      base="$(basename "$u")"
+      case "$base" in root|clp|lost+found) continue ;; esac
+      mkdir -p "$u/logs/nginx"
+      chown -R "${base}:${base}" "$u/logs" 2>/dev/null || true
+    done'
     log_info "Testing and reloading nginx on standby"
     if remote "nginx -t && (systemctl reload nginx || systemctl reload cloudpanel-nginx || true)"; then
       log_ok "Nginx reloaded on standby"

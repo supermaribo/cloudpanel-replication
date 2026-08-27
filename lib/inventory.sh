@@ -141,14 +141,19 @@ JOIN "{db_table}" d ON d.site_id = s.id
 {du_join}
 ORDER BY d.name
 '''
+seen = set()
 for row in con.execute(q):
+    db_name = clean(row["db_name"])
+    if not db_name or db_name in seen:
+        continue
+    seen.add(db_name)
     domain = domain_of(row["site_id"])
     print("\t".join([
         clean(row["site_id"]),
         domain,
         clean(row["site_user"]),
-        clean(row["db_name"]),
-        clean(row["db_user"]) or clean(row["db_name"]),
+        db_name,
+        clean(row["db_user"]) or db_name,
     ]))
 PY
 }

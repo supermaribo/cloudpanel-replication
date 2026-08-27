@@ -126,6 +126,13 @@ if [[ "${SKIP_BOOTSTRAP}" -eq 0 ]]; then
   run_bootstrap "${DB_SNAP}"
 fi
 
+# Panel accounts immediately so "Admin User Creation" is cleared even if a
+# later step (MySQL import) fails.
+if [[ "${APPLY_PANEL_DB:-1}" == "1" ]]; then
+  sync_panel_accounts "${DB_SNAP}"
+  ensure_inventory_linux_users "${DB_SNAP}"
+fi
+
 if [[ "${SKIP_USERS}" -eq 0 ]]; then
   log_info "Step 2/5: Users, FTP, SSH"
   sync_ftp_users "${DB_SNAP}"
@@ -143,6 +150,7 @@ fi
 
 if [[ "${SKIP_NGINX}" -eq 0 ]]; then
   log_info "Step 4/5: Nginx, SSL, PHP-FPM, crons"
+  ensure_inventory_linux_users "${DB_SNAP}"
   sync_nginx_ssl
   sync_php_fpm_pools
   sync_crons "${DB_SNAP}"
@@ -152,8 +160,7 @@ if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
   sync_mysql "${DB_SNAP}"
 fi
 
-log_info "CloudPanel panel settings (sqlite last, after databases exist)"
-sync_panel_data_files
+log_info "Refreshing CloudPanel panel sqlite after data sync"
 sync_panel_meta "${DB_SNAP}"
 
 DURATION="$(( $(date +%s) - START_TS ))"

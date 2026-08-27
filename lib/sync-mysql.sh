@@ -59,12 +59,12 @@ sync_mysql() {
       continue
     fi
 
-    log_info "Copying dump and importing ${db_name} on standby via mysql"
+    log_info "Copying ${db_name} dump to standby"
     remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
     rsync -a -e "${rsync_ssh}" "${dump_file}" "$(standby_target):${remote_tmp}"
+    log_info "Importing ${db_name} on standby via mysql client"
 
-    # clpctl db:import only works if the panel sqlite already has the database.
-    # Always import with the mysql client; panel UI is updated later via db.sq3.
+    # Always import with the mysql client. Panel UI is updated later via db.sq3.
     if remote_mysql_import_gz "${db_name}" "${remote_tmp}"; then
       echo "${new_sum}" >"${checksum_file}"
       [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"

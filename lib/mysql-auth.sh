@@ -104,9 +104,11 @@ dump_database() {
 
 # Run mysql on the standby using CloudPanel master credentials.
 # mode: query <sql> | exec-file <path> | import-gz <db> <gz>
+# Never probe passwordless mysql — it can hang on a password prompt.
 _remote_mysql() {
   remote bash -s -- "$@" <<'EOS'
 set -euo pipefail
+echo "standby-mysql: mode=$1" >&2
 python3 - "$@" <<'PY'
 import os, re, subprocess, sys, tempfile
 
@@ -121,19 +123,13 @@ def grab(text, *labels):
     return ""
 
 def mysql_cmd():
-    try:
-        subprocess.check_call(
-            ["mysql", "--batch", "-N", "-e", "SELECT 1"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return ["mysql"], None
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass
+    print("standby-mysql: fetching credentials", flush=True)
     out = subprocess.check_output(
         ["clpctl", "db:show:master-credentials"],
-        text=True,
+        stdin=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
+        timeout=30,
+        text=True,
     )
     user = grab(out, "User Name", "UserName", "Username", "User") or "root"
     password = grab(out, "Password")
@@ -147,36 +143,36 @@ def mysql_cmd():
     fd, cnf = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
     os.chmod(cnf, 0o600)
     with os.fdopen(fd, "w") as f:
-        f.write(f"[client]\nuser={user}\npassword={password}\nhost={host}\nport={port}\n")
-    return ["mysql", f"--defaults-extra-file={cnf}"], cnf
+        f.write(f"[client]\nuser={user}\npassword={password}\nhost={host}\nport={port}\nconnect-timeout=10\n")
+    return ["mysql", f"--defaults-extra-file={cnf}", "--batch", "--raw", "--quick"], cnf
 
 cmd, cnf = mysql_cmd()
 try:
     if mode == "query":
-        subprocess.check_call(cmd + ["--batch", "-N", "-e", args[0]])
+        subprocess.check_call(cmd + ["-N", "-e", args[0]], stdin=subprocess.DEVNULL, timeout=60)
     elif mode == "exec-file":
-        with open(args[0]) as stdin:
-            subprocess.check_call(cmd, stdin=stdin)
+        print(f"standby-mysql: exec {args[0]}", flush=True)
+        with open(args[0], "rb") as stdin:
+            subprocess.check_call(cmd, stdin=stdin, timeout=120)
     elif mode == "import-gz":
         db, gz = args[0], args[1]
         if not re.fullmatch(r"[A-Za-z0-9_]+", db):
             sys.exit(f"refusing unsafe database name: {db}")
+        print(f"standby-mysql: create database {db}", flush=True)
         subprocess.check_call(
-            cmd
-            + [
-                "--batch",
-                "-N",
-                "-e",
-                f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-            ]
+            cmd + ["-N", "-e", f"CREATE DATABASE IF NOT EXISTS `{db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"],
+            stdin=subprocess.DEVNULL,
+            timeout=30,
         )
-        gunzip = subprocess.Popen(["gunzip", "-c", gz], stdout=subprocess.PIPE)
-        mysql_rc = subprocess.call(cmd + [db], stdin=gunzip.stdout)
-        if gunzip.stdout:
-            gunzip.stdout.close()
-        gunzip.wait()
-        if mysql_rc != 0:
-            sys.exit(f"mysql import failed: {mysql_rc}")
+        sql_path = gz[:-3] if gz.endswith(".gz") else gz + ".sql"
+        print(f"standby-mysql: decompress {gz}", flush=True)
+        with open(sql_path, "wb") as outf:
+            subprocess.check_call(["gunzip", "-c", gz], stdout=outf, timeout=180)
+        print(f"standby-mysql: import {db}", flush=True)
+        with open(sql_path, "rb") as inf:
+            subprocess.check_call(cmd + [db], stdin=inf, timeout=600)
+        os.unlink(sql_path)
+        print(f"standby-mysql: import {db} done", flush=True)
     else:
         sys.exit(f"unknown mysql mode: {mode}")
 finally:
