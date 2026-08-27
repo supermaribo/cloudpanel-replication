@@ -366,6 +366,40 @@ compare_profiles() {
   checks_summary
 }
 
+# Standby-only: remove the skip-grant drop-in that crashed mysqld, then start it.
+recover_standby_mysql() {
+  echo "  Recovering standby MySQL if it is down (drop-in cleanup, then start)"
+  remote bash -s <<'EOS' || true
+set -u
+for f in \
+  /etc/mysql/mysql.conf.d/zz-clp-sync-skip-grant.cnf \
+  /etc/mysql/conf.d/zz-clp-sync-skip-grant.cnf \
+  /etc/mysql/mariadb.conf.d/zz-clp-sync-skip-grant.cnf \
+  /etc/mysql/percona-server.conf.d/zz-clp-sync-skip-grant.cnf
+do
+  [ -f "$f" ] && rm -f "$f" && echo "removed $f"
+done
+rm -f /var/lib/clp-sync/mysql-init-align.sql /var/lib/mysql/clp-sync-init.sql
+if systemctl is-active mysql >/dev/null 2>&1 || systemctl is-active mysqld >/dev/null 2>&1; then
+  echo "standby mysql already active"
+  exit 0
+fi
+echo "starting standby mysql"
+systemctl reset-failed mysql 2>/dev/null || true
+systemctl reset-failed mysqld 2>/dev/null || true
+systemctl start mysql 2>/dev/null || systemctl start mysqld 2>/dev/null || true
+sleep 3
+if systemctl is-active mysql >/dev/null 2>&1 || systemctl is-active mysqld >/dev/null 2>&1; then
+  echo "standby mysql started"
+  exit 0
+fi
+echo "standby mysql still down"
+systemctl status mysql --no-pager -l 2>/dev/null | tail -25 || true
+journalctl -u mysql -n 25 --no-pager 2>/dev/null || true
+exit 1
+EOS
+}
+
 # Run full compatibility when common.sh remote() is available
 run_peer_compatibility() {
   local role="${1:-master}"
@@ -375,6 +409,8 @@ run_peer_compatibility() {
     _check_warn "SSH remote() not available — skipping peer checks"
     return 0
   fi
+
+  recover_standby_mysql || true
 
   local master_profile standby_profile
   master_profile="$(collect_host_profile master)"
@@ -425,6 +461,7 @@ run_sync_preflight() {
   echo "=== Sync preflight ==="
   check_local_tailscale
   check_local_tools master
+  recover_standby_mysql || true
   if ! remote "echo ok && command -v clpctl && command -v rsync && command -v sqlite3 &&
     (systemctl is-active nginx >/dev/null 2>&1 || systemctl is-active cloudpanel-nginx >/dev/null 2>&1) &&
     (systemctl is-active mysql >/dev/null 2>&1 || systemctl is-active mariadb >/dev/null 2>&1)"; then
