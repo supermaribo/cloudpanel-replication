@@ -168,6 +168,45 @@ def repair_root_localhost(run_sql, user, password):
             continue
 
 
+def conf_dirs():
+    dirs = []
+    for p in (
+        "/etc/mysql/conf.d",
+        "/etc/mysql/mysql.conf.d",
+        "/etc/mysql/mariadb.conf.d",
+        "/etc/mysql/percona-server.conf.d",
+        "/etc/percona-server.conf.d",
+    ):
+        if os.path.isdir(p):
+            dirs.append(p)
+    if not dirs:
+        os.makedirs("/etc/mysql/conf.d", exist_ok=True)
+        dirs.append("/etc/mysql/conf.d")
+    return dirs
+
+
+def write_server_dropin(filename, body):
+    written = []
+    for d in conf_dirs():
+        path = os.path.join(d, filename)
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o644)
+        written.append(path)
+        print(f"standby-mysql: wrote {path}", flush=True)
+    return written
+
+
+def remove_server_dropin(filename):
+    for d in conf_dirs():
+        path = os.path.join(d, filename)
+        try:
+            os.unlink(path)
+            print(f"standby-mysql: removed {path}", flush=True)
+        except FileNotFoundError:
+            pass
+
+
 def mysql_unit():
     for name in ("mysql", "mariadb", "mysqld"):
         if subprocess.call(["systemctl", "is-active", "--quiet", name]) == 0:
@@ -175,35 +214,108 @@ def mysql_unit():
     return "mysql"
 
 
-def skip_grant_repair(user, password):
-    """Standby-only: CloudPanel issue 748 style repair when no admin login works."""
+def wait_mysql_up(timeout=45):
     unit = mysql_unit()
-    print(f"standby-mysql: skip-grant-tables repair via {unit}", flush=True)
-    subprocess.check_call(
-        ["systemctl", "set-environment", "MYSQLD_OPTS=--skip-grant-tables --skip-networking"]
-    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if subprocess.call(["systemctl", "is-active", "--quiet", unit]) == 0:
+            for sock in (
+                "/run/mysqld/mysqld.sock",
+                "/var/run/mysqld/mysqld.sock",
+                "/tmp/mysql.sock",
+            ):
+                if os.path.exists(sock):
+                    time.sleep(1)
+                    return True
+        time.sleep(1)
+    return subprocess.call(["systemctl", "is-active", "--quiet", unit]) == 0
+
+
+def restart_mysql():
+    unit = mysql_unit()
+    print(f"standby-mysql: restarting {unit}", flush=True)
     subprocess.check_call(["systemctl", "restart", unit])
-    time.sleep(4)
-    escaped = sql_quote(password)
-    sql = (
-        f"CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}';"
-        f"CREATE USER IF NOT EXISTS '{user}'@'localhost' IDENTIFIED BY '{escaped}';"
-        f"ALTER USER '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}';"
-        f"ALTER USER '{user}'@'localhost' IDENTIFIED BY '{escaped}';"
+    if not wait_mysql_up():
+        print("standby-mysql: warning: mysql did not become ready after restart", flush=True)
+
+
+def ensure_skip_name_resolve():
+    """Standby-only. 127.0.0.1 reverse-DNSes to localhost, so CloudPanel's
+    root@127.0.0.1 password is never used (ERROR 1698 unix_socket)."""
+    marker = os.path.join("/var/lib/clp-sync", "mysql-skip-name-resolve")
+    already = False
+    for d in conf_dirs():
+        if os.path.isfile(os.path.join(d, "zz-clp-sync-skip-name-resolve.cnf")):
+            already = True
+            break
+    write_server_dropin(
+        "zz-clp-sync-skip-name-resolve.cnf",
+        "[mysqld]\nskip-name-resolve=ON\n",
     )
-    try:
-        subprocess.run(
-            ["mysql", "-u", "root", "--batch", "-e", sql],
+    os.makedirs("/var/lib/clp-sync", exist_ok=True)
+    if already and os.path.isfile(marker):
+        print("standby-mysql: skip-name-resolve already enabled", flush=True)
+        return False
+    restart_mysql()
+    with open(marker, "w") as f:
+        f.write("1\n")
+    return True
+
+
+def socket_root_sql(sql):
+    attempts = (
+        ["mysql", "-u", "root", "--protocol=SOCKET", "--batch", "--skip-password", "-e", sql],
+        ["mysql", "-u", "root", "--batch", "--skip-password", "-e", sql],
+        ["mysql", "--protocol=SOCKET", "--batch", "-e", sql],
+    )
+    last = ""
+    for args in attempts:
+        p = subprocess.run(
+            args,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
+            timeout=20,
+            text=True,
         )
-    finally:
-        subprocess.call(["systemctl", "unset-environment", "MYSQLD_OPTS"])
-        subprocess.check_call(["systemctl", "restart", unit])
-        time.sleep(4)
+        err = ((p.stderr or "") + (p.stdout or "")).strip().replace("\n", " ")
+        print(f"standby-mysql: socket-sql rc={p.returncode} {err[-240:]}", flush=True)
+        if p.returncode == 0:
+            return True
+        last = err
+    return False
+
+
+def skip_grant_repair(user, password):
+    """Standby-only. MYSQLD_OPTS is ignored by CloudPanel's systemd unit;
+    write a real mysqld drop-in instead. Do not FLUSH PRIVILEGES while
+    skip-grant-tables is on (MariaDB reloads grants and locks us out)."""
+    print("standby-mysql: skip-grant-tables via mysqld drop-in", flush=True)
+    write_server_dropin(
+        "zz-clp-sync-skip-grant.cnf",
+        "[mysqld]\nskip-grant-tables\nskip-networking\n",
+    )
+    restart_mysql()
+    escaped = sql_quote(password)
+    statements = [
+        f"CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        f"CREATE USER IF NOT EXISTS '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
+        f"ALTER USER '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        (
+            f"ALTER USER '{user}'@'localhost' IDENTIFIED VIA "
+            f"mysql_native_password USING PASSWORD('{escaped}') OR unix_socket"
+        ),
+        f"ALTER USER '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
+    ]
+    any_ok = False
+    for sql in statements:
+        if socket_root_sql(sql):
+            any_ok = True
+    if not any_ok:
+        print("standby-mysql: skip-grant SQL did not run (drop-in may not have loaded)", flush=True)
+    remove_server_dropin("zz-clp-sync-skip-grant.cnf")
+    restart_mysql()
+    return any_ok
 
 
 def build_client():
@@ -255,6 +367,24 @@ def build_client():
             print(f"standby-mysql: MYSQL_PWD probe failed: {err[-1]}", flush=True)
     except subprocess.TimeoutExpired:
         print("standby-mysql: MYSQL_PWD probe timed out", flush=True)
+
+    print("standby-mysql: enabling skip-name-resolve on standby MySQL", flush=True)
+    ensure_skip_name_resolve()
+    if probe(tcp):
+        print("standby-mysql: auth=cloudpanel-tcp after skip-name-resolve", flush=True)
+        return tcp, temps, None
+    cmd, env = with_pwd(env_tcp)
+    p = subprocess.run(
+        cmd + ["-N", "-e", "SELECT 1"],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    if p.returncode == 0:
+        print("standby-mysql: auth=MYSQL_PWD-tcp after skip-name-resolve", flush=True)
+        return cmd, temps, env
 
     debian = "/etc/mysql/debian.cnf"
     if os.path.isfile(debian):
@@ -308,8 +438,8 @@ def build_client():
         return cmd, temps, env
 
     sys.exit(
-        "standby mysql auth failed: CloudPanel root@127.0.0.1 was rejected as "
-        "root@localhost (ERROR 1698). PHP mysqli and skip-grant-tables repair also failed."
+        "standby mysql auth failed: 127.0.0.1 is authenticated as root@localhost "
+        "(ERROR 1698). skip-name-resolve and skip-grant-tables repair did not fix it."
     )
 
 
