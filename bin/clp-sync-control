@@ -14,8 +14,8 @@ Usage: clp-sync-control <on|off|status>
 
 Toggle outbound sync on the master (systemd timer).
 
-  on      Enable sync timer
-  off     Disable sync timer (pause replication)
+  on      Enable the 15-minute sync timer
+  off     Disable the timer (manual clp-bootstrap / clp-sync still work)
   status  Show current setting
 EOF
 }
@@ -41,9 +41,12 @@ case "${ACTION}" in
       source "${cfg}"
       echo "ROLE=${ROLE:-unknown}"
       echo "SYNC_ENABLED=${SYNC_ENABLED:-1}"
+      echo "SYNC_AUTO=${SYNC_AUTO:-0}"
       echo "STANDBY_HOST=${STANDBY_HOST:-}"
       echo "PROMOTED=${PROMOTED:-0}"
       [[ "${PROMOTED:-0}" == "1" ]] && grep ^PROMOTED_AT= "${cfg}" || true
+      echo -n "timer="
+      systemctl is-enabled clp-sync.timer 2>/dev/null || echo "disabled"
       systemctl is-active clp-sync.timer 2>/dev/null || echo "timer=inactive"
     else
       echo "Not configured"

@@ -33,16 +33,17 @@ toggle_sync() {
   case "${on_off}" in
     on|enable|1)
       config_set_kv "SYNC_ENABLED" "1"
+      config_set_kv "SYNC_AUTO" "1"
       if [[ -f /etc/systemd/system/clp-sync.timer ]]; then
         systemctl enable --now clp-sync.timer
       fi
-      echo "Sync enabled (timer started if installed)"
+      echo "Automatic sync enabled (15-minute timer started)"
       ;;
     off|disable|0)
-      config_set_kv "SYNC_ENABLED" "0"
-      systemctl stop clp-sync.timer 2>/dev/null || true
+      config_set_kv "SYNC_AUTO" "0"
+      systemctl disable --now clp-sync.timer 2>/dev/null || true
       systemctl stop clp-sync.service 2>/dev/null || true
-      echo "Sync disabled (timer stopped)"
+      echo "Automatic sync disabled (timer stopped). Manual clp-bootstrap / clp-sync still work."
       ;;
     *)
       die "Usage: toggle_sync on|off"
@@ -228,6 +229,7 @@ configure_new_standby() {
   fi
 
   install_master_systemd
+  config_set_kv "SYNC_AUTO" "1"
   systemctl enable --now clp-sync.timer
   echo "New standby configured. Sync enabled."
   echo "Run: /opt/clp-sync/bin/clp-bootstrap"

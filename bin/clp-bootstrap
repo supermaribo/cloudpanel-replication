@@ -12,6 +12,9 @@ source "${ROOT}/lib/sync-bootstrap.sh"
 # shellcheck source=../lib/checks.sh
 source "${ROOT}/lib/checks.sh"
 
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+
 require_root
 load_config
 
@@ -19,12 +22,17 @@ if [[ "${ROLE:-master}" == "standby" ]]; then
   die "This host is ROLE=standby — run bootstrap only on the master"
 fi
 
+config_set_kv "SYNC_AUTO" "0"
+systemctl disable --now clp-sync.timer 2>/dev/null || true
+systemctl stop clp-sync.service 2>/dev/null || true
+
 CLP_SYNC_LOG_FILE="${CLP_SYNC_LOG_DIR}/bootstrap-$(date -u +%Y%m%d).log"
 touch "${CLP_SYNC_LOG_FILE}"
 chmod 600 "${CLP_SYNC_LOG_FILE}"
 
 require_cmds ssh sqlite3 openssl clpctl
 log_info "clp-bootstrap → ${STANDBY_HOST}"
+log_info "Automatic 15-minute sync is OFF until this is stable (clp-sync-control on to re-enable)"
 
 log_info "Running full compatibility checks before bootstrap"
 checks_reset

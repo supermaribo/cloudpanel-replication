@@ -261,10 +261,18 @@ if ask_yn "Run first full clone (bootstrap) now? This only writes to the standby
 fi
 
 echo
-if ask_yn "Enable 15-minute sync timer on this master?" "y"; then
+if ask_yn "Enable 15-minute sync timer on this master?" "n"; then
+  if grep -q '^SYNC_AUTO=' /etc/clp-sync/config.env 2>/dev/null; then
+    sed -i 's/^SYNC_AUTO=.*/SYNC_AUTO=1/' /etc/clp-sync/config.env
+  else
+    echo 'SYNC_AUTO=1' >> /etc/clp-sync/config.env
+  fi
   systemctl enable --now clp-sync.timer
   c_ok "Timer enabled"
   systemctl list-timers clp-sync.timer --no-pager || true
+else
+  systemctl disable --now clp-sync.timer 2>/dev/null || true
+  c_info "Timer left off — enable later with: /opt/clp-sync/bin/clp-sync-control on"
 fi
 
 echo

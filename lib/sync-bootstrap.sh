@@ -295,7 +295,7 @@ bootstrap_database_on_standby() {
     log_ok "MySQL database ${db_name} ready on standby"
     return 0
   fi
-  log_error "Could not create MySQL database ${db_name} on standby"
+  log_error "Could not create MySQL database ${db_name} on standby (mysql client failed — not treating as OK)"
   return 1
 }
 

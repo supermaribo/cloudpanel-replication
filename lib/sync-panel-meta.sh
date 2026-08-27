@@ -3,87 +3,197 @@
 
 CLP_APP_ENV="${CLP_APP_ENV:-}"
 
-_find_app_env_file() {
-  local f
-  if [[ -n "${CLP_APP_ENV}" && -f "${CLP_APP_ENV}" ]]; then
-    echo "${CLP_APP_ENV}"
-    return 0
-  fi
+# Print "source_path<TAB>secret". Never log the secret.
+_harvest_app_secret() {
+  CLP_APP_ENV="${CLP_APP_ENV:-}" python3 - <<'PY'
+import os, pathlib, re, sys
+
+def from_env_text(text):
+    m = re.search(r"(?m)^APP_SECRET=(.*)$", text)
+    return m.group(1).strip().strip("\"'") if m else ""
+
+def from_php_return(text):
+    m = re.search(r"['\"]APP_SECRET['\"]\s*=>\s*['\"]([^'\"]+)['\"]", text)
+    return m.group(1) if m else ""
+
+def from_fpm(text):
+    m = re.search(r"(?m)^\s*env\[APP_SECRET\]\s*=\s*(.*)$", text)
+    return m.group(1).strip().strip("\"'") if m else ""
+
+candidates = []
+if os.environ.get("CLP_APP_ENV"):
+    candidates.append(pathlib.Path(os.environ["CLP_APP_ENV"]))
+for p in (
+    "/home/clp/htdocs/app/.env",
+    "/home/clp/htdocs/app/.env.local",
+    "/home/clp/htdocs/app/.env.prod.local",
+    "/home/clp/htdocs/app/.env.local.php",
+    "/home/clp/htdocs/app/files/.env",
+    "/home/clp/htdocs/app/files/.env.local",
+    "/home/clp/htdocs/app/files/.env.local.php",
+    "/home/clp/.env",
+):
+    candidates.append(pathlib.Path(p))
+root = pathlib.Path("/home/clp/htdocs/app")
+if root.is_dir():
+    candidates.extend(p for p in root.glob("**/.env*") if p.is_file())
+php = pathlib.Path("/etc/php")
+if php.is_dir():
+    candidates.extend(php.glob("*/fpm/pool.d/*.conf"))
+
+seen = set()
+for path in candidates:
+    try:
+        path = path.resolve()
+    except OSError:
+        continue
+    if path in seen or not path.is_file():
+        continue
+    seen.add(path)
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        continue
+    secret = from_env_text(text) or from_php_return(text) or from_fpm(text)
+    if secret:
+        print(f"{path}\t{secret}")
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+_apply_app_secret_standby() {
+  remote bash -s -- "$1" <<'EOS'
+set -euo pipefail
+python3 - "$1" <<'PY'
+import os, pathlib, pwd, re, sys
+secret = sys.argv[1]
+line = "APP_SECRET=" + secret
+written = []
+
+def write_env(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        text = path.read_text(errors="replace")
+        if re.search(r"^APP_SECRET=", text, re.M):
+            text = re.sub(r"^APP_SECRET=.*$", lambda _m: line, text, count=1, flags=re.M)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += line + "\n"
+        path.write_text(text)
+    else:
+        path.write_text("APP_ENV=prod\n" + line + "\n")
+    try:
+        clp = pwd.getpwnam("clp")
+        os.chown(path, clp.pw_uid, clp.pw_gid)
+        os.chmod(path, 0o640)
+    except Exception:
+        pass
+    written.append(str(path))
+
+for path in (
+    pathlib.Path("/home/clp/htdocs/app/.env"),
+    pathlib.Path("/home/clp/htdocs/app/files/.env"),
+):
+    write_env(path)
+
+app = pathlib.Path("/home/clp/htdocs/app")
+if app.is_dir():
+    for path in app.glob("**/.env*"):
+        if not path.is_file():
+            continue
+        if path.suffix == ".php" or path.name.endswith(".php"):
+            text = path.read_text(errors="replace")
+            if re.search(r"['\"]APP_SECRET['\"]\s*=>", text):
+                text = re.sub(
+                    r"(['\"]APP_SECRET['\"]\s*=>\s*['\"])[^'\"]*(['\"])",
+                    lambda m: m.group(1) + secret + m.group(2),
+                    text,
+                    count=1,
+                )
+                path.write_text(text)
+                written.append(str(path))
+            continue
+        if str(path) in written:
+            continue
+        write_env(path)
+
+php = pathlib.Path("/etc/php")
+if php.is_dir():
+    for path in php.glob("*/fpm/pool.d/*.conf"):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if "APP_SECRET" not in text:
+            continue
+        new = re.sub(r"(?m)^(\s*env\[APP_SECRET\]\s*=\s*).*$", r"\1" + secret, text)
+        if new != text:
+            path.write_text(new)
+            written.append(str(path))
+
+print(" ".join(sorted(set(written))))
+PY
+EOS
+}
+
+_repair_standby_panel_runtime() {
+  log_info "Clearing CloudPanel cache and reloading PHP-FPM on standby"
+  remote bash -s <<'EOS'
+set +e
+rm -rf /home/clp/htdocs/app/var/cache/* 2>/dev/null
+mkdir -p /home/clp/htdocs/app/var/cache /home/clp/htdocs/app/var/log
+chown -R clp:clp /home/clp/htdocs/app/var /home/clp/htdocs/app/data /home/clp/htdocs/app/.env /home/clp/htdocs/app/files/.env 2>/dev/null
+chmod 660 /home/clp/htdocs/app/data/db.sq3 2>/dev/null
+for s in php*-fpm; do
+  systemctl reload "$s" 2>/dev/null || systemctl restart "$s" 2>/dev/null
+done
+echo "==== panel error log ===="
+ls -lt /home/clp/htdocs/app/var/log 2>/dev/null | head -10
+tail -n 40 /home/clp/htdocs/app/var/log/prod.log 2>/dev/null
+tail -n 20 /home/clp/logs/nginx/error.log 2>/dev/null
+true
+EOS
+}
+
+# Standby must use the same APP_SECRET as master or the copied panel sqlite
+# (encrypted passwords/settings) throws a Symfony 500.
+sync_panel_app_secret() {
+  local harvested source_path secret rsync_ssh
+  rsync_ssh="$(rsync_ssh_cmd)"
+
+  log_info "Aligning CloudPanel APP_SECRET on standby with master"
+  remote "mkdir -p /home/clp/htdocs/app /home/clp/htdocs/app/files"
   for f in \
     /home/clp/htdocs/app/.env \
     /home/clp/htdocs/app/.env.local \
+    /home/clp/htdocs/app/.env.local.php \
     /home/clp/htdocs/app/.env.prod.local \
-    /home/clp/.env
+    /home/clp/htdocs/app/files/.env \
+    /home/clp/htdocs/app/files/.env.local \
+    /home/clp/htdocs/app/files/.env.local.php
   do
-    if [[ -f "${f}" ]] && grep -q '^APP_SECRET=' "${f}"; then
-      echo "${f}"
-      return 0
+    if [[ -f "${f}" ]]; then
+      rsync -a -e "${rsync_ssh}" "${f}" "$(standby_target):${f}"
+      log_info "Copied ${f} to standby"
     fi
   done
-  while IFS= read -r f; do
-    if grep -q '^APP_SECRET=' "${f}"; then
-      echo "${f}"
-      return 0
-    fi
-  done < <(find /home/clp/htdocs/app -maxdepth 3 -name '.env*' -type f 2>/dev/null | head -20)
-  return 1
-}
 
-# Standby must use the same APP_SECRET as master or copied panel passwords
-# (admin login, encrypted DB users) will not decrypt.
-sync_panel_app_secret() {
-  local env_file secret
-  env_file="$(_find_app_env_file || true)"
-  if [[ -z "${env_file}" ]]; then
-    log_warn "No APP_SECRET file found under /home/clp — admin login may need a password reset after failover"
-    return 0
+  harvested="$(_harvest_app_secret 2>/dev/null || true)"
+  if [[ -z "${harvested}" ]]; then
+    log_error "Could not find APP_SECRET on master (checked .env, files/.env, php-fpm pools)"
+    return 1
   fi
-  secret="$(python3 - "${env_file}" <<'PY'
-import pathlib, re, sys
-text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-m = re.search(r"^APP_SECRET=(.*)$", text, re.M)
-if not m:
-    sys.exit(0)
-print(m.group(1).strip().strip("\"'"))
-PY
-)"
+  source_path="${harvested%%$'\t'*}"
+  secret="${harvested#*$'\t'}"
   if [[ -z "${secret}" ]]; then
-    log_warn "No APP_SECRET in master ${env_file}"
-    return 0
+    log_error "APP_SECRET harvest was empty"
+    return 1
   fi
-  remote bash -s -- "${env_file}" "${secret}" <<'EOS'
-set -euo pipefail
-written="$(python3 - "$1" "$2" <<'PY'
-import pathlib, re, sys
-wanted = pathlib.Path(sys.argv[1])
-secret = sys.argv[2]
-candidates = [wanted] + [
-    pathlib.Path(p) for p in (
-        "/home/clp/htdocs/app/.env",
-        "/home/clp/htdocs/app/.env.local",
-        "/home/clp/htdocs/app/.env.prod.local",
-        "/home/clp/.env",
-    )
-]
-path = next((p for p in candidates if p.is_file()), None)
-if path is None:
-    sys.exit("standby .env missing")
-text = path.read_text(errors="replace")
-line = "APP_SECRET=" + secret
-if re.search(r"^APP_SECRET=", text, re.M):
-    text = re.sub(r"^APP_SECRET=.*$", lambda _m: line, text, count=1, flags=re.M)
-else:
-    if not text.endswith("\n"):
-        text += "\n"
-    text += line + "\n"
-path.write_text(text)
-print(str(path))
-PY
-)"
-chown clp:clp "${written}" 2>/dev/null || true
-chmod 640 "${written}" 2>/dev/null || true
-EOS
-  log_ok "Standby CloudPanel APP_SECRET matches master (${env_file})"
+  log_info "APP_SECRET found in ${source_path}"
+  _apply_app_secret_standby "${secret}" >/dev/null
+  log_ok "Standby APP_SECRET matches master"
 }
 
 _standby_panel_user_summary() {
@@ -160,6 +270,7 @@ EOS
   printf '%s\n' "${summary}" | tail -n +2 | while IFS=$'\t' read -r name role; do
     [[ -n "${name}" ]] && log_info "  panel user: ${name} ${role}"
   done
+  _repair_standby_panel_runtime
 }
 
 # Sync panel data files beyond sqlite (custom branding, etc.)

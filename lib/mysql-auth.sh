@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# MySQL auth for CloudPanel: root@localhost is often denied without a password.
-# Use clpctl db:show:master-credentials (typically root@127.0.0.1).
+# MySQL auth for CloudPanel: root@localhost is unix_socket (ERROR 1698).
+# Prefer an exclusive defaults-file (not extra-file) so ~/.my.cnf cannot
+# force a Unix socket. On the standby, fall back to debian-sys-maint.
 
 MYSQL_DEFAULTS_FILE="${MYSQL_DEFAULTS_FILE:-}"
 
 mysql_cli() {
   if [[ -n "${MYSQL_DEFAULTS_FILE}" ]]; then
-    mysql --defaults-extra-file="${MYSQL_DEFAULTS_FILE}" "$@"
+    mysql --defaults-file="${MYSQL_DEFAULTS_FILE}" "$@"
   else
     mysql "$@"
   fi
@@ -14,7 +15,7 @@ mysql_cli() {
 
 mysqldump_cli() {
   if [[ -n "${MYSQL_DEFAULTS_FILE}" ]]; then
-    mysqldump --defaults-extra-file="${MYSQL_DEFAULTS_FILE}" "$@"
+    mysqldump --defaults-file="${MYSQL_DEFAULTS_FILE}" "$@"
   else
     mysqldump "$@"
   fi
@@ -39,6 +40,10 @@ port = grab("Port") or "3306"
 m = re.search(r"-p'([^']+)'", text)
 if m:
     password = m.group(1)
+else:
+    m = re.search(r'-p"([^"]+)"', text)
+    if m:
+        password = m.group(1)
 m = re.search(r"-h\s*([0-9.]+)", text)
 if m:
     host = m.group(1)
@@ -48,13 +53,37 @@ print(f"{user}\t{password}\t{host}\t{port}")
 PY
 }
 
-# Build a mode-600 mysql client cnf for this run.
+_write_mysql_cnf() {
+  local cnf="$1" user="$2" pass="$3" host="${4:-127.0.0.1}" port="${5:-3306}"
+  MYSQL_CNF_PATH="${cnf}" MYSQL_CNF_USER="${user}" MYSQL_CNF_PASS="${pass}" \
+    MYSQL_CNF_HOST="${host}" MYSQL_CNF_PORT="${port}" python3 - <<'PY'
+import os, pathlib
+path = pathlib.Path(os.environ["MYSQL_CNF_PATH"])
+
+def q(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+lines = [
+    "[client]",
+    "user=" + q(os.environ["MYSQL_CNF_USER"]),
+    "password=" + q(os.environ["MYSQL_CNF_PASS"]),
+    "host=" + q(os.environ.get("MYSQL_CNF_HOST") or "127.0.0.1"),
+    "port=" + q(os.environ.get("MYSQL_CNF_PORT") or "3306"),
+    "protocol=tcp",
+    "connect-timeout=10",
+]
+path.write_text("\n".join(lines) + "\n")
+path.chmod(0o600)
+PY
+}
+
+# Build a mode-600 mysql client cnf for this run (master dump path).
 ensure_mysql_defaults() {
   local cnf="${CLP_SYNC_TMP_DIR}/mysql-client.cnf"
   mkdir -p "${CLP_SYNC_TMP_DIR}"
 
   if [[ -n "${MYSQL_DEFAULTS_FILE}" && -f "${MYSQL_DEFAULTS_FILE}" ]] \
-     && mysql --defaults-extra-file="${MYSQL_DEFAULTS_FILE}" --batch -N -e "SELECT 1" >/dev/null 2>&1; then
+     && mysql --defaults-file="${MYSQL_DEFAULTS_FILE}" --batch -N -e "SELECT 1" >/dev/null 2>&1; then
     return 0
   fi
 
@@ -67,16 +96,8 @@ ensure_mysql_defaults() {
   out="$(clpctl db:show:master-credentials 2>/dev/null || true)"
   if line="$(_parse_clp_master_creds "${out}")"; then
     IFS=$'\t' read -r user pass host port <<<"${line}"
-    cat >"${cnf}" <<EOF
-[client]
-user=${user}
-password=${pass}
-host=127.0.0.1
-port=${port}
-protocol=tcp
-EOF
-    chmod 600 "${cnf}"
-    if mysql --defaults-extra-file="${cnf}" -h 127.0.0.1 --protocol=TCP --batch -N -e "SELECT 1" >/dev/null 2>&1; then
+    _write_mysql_cnf "${cnf}" "${user}" "${pass}" "127.0.0.1" "${port}"
+    if mysql --defaults-file="${cnf}" --batch -N -e "SELECT 1" >/dev/null 2>&1; then
       MYSQL_DEFAULTS_FILE="${cnf}"
       log_info "MySQL client using CloudPanel master credentials (${user}@127.0.0.1)"
       return 0
@@ -115,6 +136,8 @@ import os, re, subprocess, sys, tempfile
 
 mode = sys.argv[1]
 args = sys.argv[2:]
+os.environ.pop("MYSQL_HOST", None)
+os.environ.pop("MYSQL_UNIX_PORT", None)
 
 def grab(text, *labels):
     for lab in labels:
@@ -123,7 +146,25 @@ def grab(text, *labels):
             return m.group(1).strip().strip("'\"")
     return ""
 
-def mysql_cmd():
+def q(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+def write_cnf(user, password, host="127.0.0.1", port="3306"):
+    fd, path = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
+    os.chmod(path, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(
+            "[client]\n"
+            f"user={q(user)}\n"
+            f"password={q(password)}\n"
+            f"host={q(host)}\n"
+            f"port={q(port)}\n"
+            "protocol=tcp\n"
+            "connect-timeout=10\n"
+        )
+    return path
+
+def parse_clpctl():
     print("standby-mysql: fetching credentials", flush=True)
     out = subprocess.check_output(
         ["clpctl", "db:show:master-credentials"],
@@ -138,29 +179,115 @@ def mysql_cmd():
     m = re.search(r"-p'([^']+)'", out)
     if m:
         password = m.group(1)
+    else:
+        m = re.search(r'-p"([^"]+)"', out)
+        if m:
+            password = m.group(1)
     if not password:
         sys.exit("no mysql password from clpctl on standby")
-    fd, cnf = tempfile.mkstemp(prefix="clp-mysql-", dir="/var/tmp")
-    os.chmod(cnf, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(
-            "[client]\n"
-            f"user={user}\n"
-            f"password={password}\n"
-            "host=127.0.0.1\n"
-            f"port={port}\n"
-            "protocol=tcp\n"
-            "connect-timeout=10\n"
-        )
-    return [
-        "mysql",
-        f"--defaults-extra-file={cnf}",
-        "-h", "127.0.0.1",
-        "--protocol=TCP",
-        "--batch", "--raw", "--quick",
-    ], cnf
+    return user, password, port, out
 
-cmd, cnf = mysql_cmd()
+def probe(cmd, timeout=15):
+    try:
+        p = subprocess.run(
+            cmd + ["-N", "-e", "SELECT 1"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+        if p.returncode == 0:
+            return True
+        err = (p.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        if err:
+            print(f"standby-mysql: probe failed: {err[-1]}", flush=True)
+        return False
+    except subprocess.TimeoutExpired:
+        print("standby-mysql: probe timed out", flush=True)
+        return False
+
+def repair_root_localhost(admin_cmd, user, password):
+    # 127.0.0.1 often reverse-DNSes to localhost, so CloudPanel's
+    # root@127.0.0.1 password never matches. Allow the same password on
+    # root@localhost (keep unix_socket as an OR plugin when MariaDB supports it).
+    escaped = password.replace("\\", "\\\\").replace("'", "''")
+    statements = [
+        f"CREATE USER IF NOT EXISTS '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        f"ALTER USER '{user}'@'127.0.0.1' IDENTIFIED BY '{escaped}'",
+        f"CREATE USER IF NOT EXISTS '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
+        (
+            f"ALTER USER '{user}'@'localhost' IDENTIFIED VIA "
+            f"mysql_native_password USING PASSWORD('{escaped}') OR unix_socket"
+        ),
+        f"ALTER USER '{user}'@'localhost' IDENTIFIED BY '{escaped}'",
+        "FLUSH PRIVILEGES",
+    ]
+    for sql in statements:
+        try:
+            subprocess.check_call(
+                admin_cmd + ["-e", sql],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            continue
+
+def mysql_cmd():
+    user, password, port, _raw = parse_clpctl()
+    temps = []
+    try:
+        cnf = write_cnf(user, password, "127.0.0.1", port)
+        temps.append(cnf)
+        tcp = [
+            "mysql",
+            f"--defaults-file={cnf}",
+            "--batch",
+            "--raw",
+            "--quick",
+        ]
+        if probe(tcp):
+            print("standby-mysql: auth=cloudpanel-tcp", flush=True)
+            return tcp, temps
+
+        print(
+            "standby-mysql: cloudpanel TCP failed (likely root@localhost unix_socket / 1698)",
+            flush=True,
+        )
+
+        debian = "/etc/mysql/debian.cnf"
+        if os.path.isfile(debian):
+            deb = [
+                "mysql",
+                f"--defaults-file={debian}",
+                "--batch",
+                "--raw",
+                "--quick",
+            ]
+            if probe(deb):
+                print("standby-mysql: auth=debian-sys-maint; repairing root@localhost", flush=True)
+                repair_root_localhost(deb, user, password)
+                if probe(tcp):
+                    print("standby-mysql: auth=cloudpanel-tcp after repair", flush=True)
+                    return tcp, temps
+                print("standby-mysql: auth=debian-sys-maint", flush=True)
+                return deb, temps
+
+        sys.exit(
+            "standby mysql auth failed: CloudPanel root@127.0.0.1 was rejected as "
+            "root@localhost (ERROR 1698) and /etc/mysql/debian.cnf is missing or unusable"
+        )
+    except BaseException:
+        for path in temps:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+
+cmd, temps = mysql_cmd()
 try:
     if mode == "query":
         subprocess.check_call(cmd + ["-N", "-e", args[0]], stdin=subprocess.DEVNULL, timeout=60)
@@ -190,8 +317,11 @@ try:
     else:
         sys.exit(f"unknown mysql mode: {mode}")
 finally:
-    if cnf:
-        os.unlink(cnf)
+    for path in temps:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 PY
 EOS
 }
@@ -204,14 +334,15 @@ remote_mysql_query() {
 remote_mysql_sql() {
   local sql="$1"
   local f="${CLP_SYNC_TMP_DIR}/remote-one.sql"
-  local rsync_ssh
+  local rsync_ssh rc=0
   rsync_ssh="$(rsync_ssh_cmd)"
   printf '%s\n' "${sql}" >"${f}"
   chmod 600 "${f}"
   remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
   rsync -a -e "${rsync_ssh}" "${f}" "$(standby_target):/var/tmp/clp-sync-import/remote-one.sql"
-  remote_mysql_file /var/tmp/clp-sync-import/remote-one.sql
-  remote "rm -f /var/tmp/clp-sync-import/remote-one.sql"
+  remote_mysql_file /var/tmp/clp-sync-import/remote-one.sql || rc=$?
+  remote "rm -f /var/tmp/clp-sync-import/remote-one.sql" || true
+  return "${rc}"
 }
 
 # Run a SQL file on the standby with that host's CloudPanel MySQL credentials.

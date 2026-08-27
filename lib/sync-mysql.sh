@@ -19,7 +19,7 @@ sync_mysql() {
   ensure_mysql_defaults || true
 
   local site_id domain site_user db_name db_user
-  local dump_file checksum_file old_sum new_sum remote_tmp fp old_fp
+  local dump_file checksum_file imported_stamp old_sum new_sum remote_tmp fp old_fp
 
   log_info "Syncing MySQL databases (dump/import only if data changed)"
   run_bootstrap_databases "${db_snap}" || true
@@ -32,9 +32,10 @@ sync_mysql() {
 
     dump_file="${dump_dir}/${db_name}.sql.gz"
     checksum_file="${checksum_dir}/${db_name}.sha256"
+    imported_stamp="${checksum_dir}/${db_name}.imported"
     remote_tmp="/var/tmp/clp-sync-import/${db_name}.sql.gz"
 
-    if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" ]] && incremental_on; then
+    if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" ]] && incremental_on && [[ -f "${imported_stamp}" ]]; then
       fp="$(mysql_db_fingerprint "${db_name}" || true)"
       old_fp="$(load_checksum "mysql-fp-${db_name}")"
       if [[ -n "${fp}" && -n "${old_fp}" && "${fp}" == "${old_fp}" ]]; then
@@ -52,7 +53,7 @@ sync_mysql() {
     old_sum=""
     [[ -f "${checksum_file}" ]] && old_sum="$(cat "${checksum_file}")"
 
-    if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" && "${new_sum}" == "${old_sum}" ]]; then
+    if [[ "${MYSQL_SKIP_UNCHANGED}" == "1" && "${new_sum}" == "${old_sum}" && -f "${imported_stamp}" ]]; then
       log_info "Unchanged dump ${db_name} (skip import)"
       [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
       INC_MYSQL_SKIP=$((INC_MYSQL_SKIP + 1))
@@ -67,12 +68,14 @@ sync_mysql() {
     # Always import with the mysql client. Panel UI is updated later via db.sq3.
     if remote_mysql_import_gz "${db_name}" "${remote_tmp}"; then
       echo "${new_sum}" >"${checksum_file}"
+      date -u +'%Y-%m-%dT%H:%M:%SZ' >"${imported_stamp}"
       [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
       remote "rm -f '${remote_tmp}'"
       INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
       log_ok "Imported ${db_name}"
     else
       log_error "Import failed for ${db_name}"
+      rm -f "${imported_stamp}"
       return 1
     fi
   done < <(inventory_databases "${db_snap}")

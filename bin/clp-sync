@@ -72,6 +72,14 @@ if [[ "${ROLE:-master}" == "standby" ]]; then
   die "This host is ROLE=standby — run sync only on the master (or clp-promote after primary loss)"
 fi
 
+# systemd timer / systemctl start: no-op until SYNC_AUTO=1.
+# Manual `/opt/clp-sync/bin/clp-sync` and clp-bootstrap still run.
+if [[ -n "${INVOCATION_ID:-}" && "${SYNC_AUTO:-0}" != "1" ]]; then
+  echo "clp-sync: automatic sync is off (SYNC_AUTO=0) — scheduled run skipped"
+  echo "Enable later with: /opt/clp-sync/bin/clp-sync-control on"
+  exit 0
+fi
+
 if [[ "${SYNC_ENABLED:-1}" != "1" ]]; then
   die "Sync is disabled (SYNC_ENABLED=0). Enable with: clp-sync-control on  or configure standby: clp-set-standby"
 fi

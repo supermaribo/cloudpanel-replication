@@ -171,6 +171,7 @@ PROMOTED=0
 PROMOTED_AT=
 FORMER_PRIMARY_HOST=
 SYNC_ENABLED=$([[ "${role}" == "master" ]] && echo 1 || echo 0)
+SYNC_AUTO=0
 
 # Peer over Tailscale
 STANDBY_HOST=${peer_host}

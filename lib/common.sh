@@ -63,6 +63,7 @@ load_config() {
   : "${PRIMARY_HOST:=}"
   : "${STANDBY_HOST:=}"
   : "${SYNC_ENABLED:=1}"
+  : "${SYNC_AUTO:=0}"
   : "${PROMOTED:=0}"
   : "${FORMER_PRIMARY_HOST:=}"
   : "${PROMOTED_AT:=}"
