@@ -61,9 +61,15 @@ load_config() {
   : "${FAIL_NOTIFY_CMD:=}"
   : "${PRIMARY_HOST:=}"
   : "${STANDBY_HOST:=}"
+  : "${SYNC_ENABLED:=1}"
+  : "${PROMOTED:=0}"
+  : "${FORMER_PRIMARY_HOST:=}"
+  : "${PROMOTED_AT:=}"
 
-  if [[ "${ROLE}" == "master" && -z "${STANDBY_HOST}" ]]; then
-    die "STANDBY_HOST required for ROLE=master"
+  if [[ "${ROLE}" == "standby" ]]; then
+    : # standby does not need STANDBY_HOST
+  elif [[ "${ROLE}" == "master" && "${SYNC_ENABLED}" == "1" && -z "${STANDBY_HOST}" ]]; then
+    die "STANDBY_HOST required for ROLE=master with SYNC_ENABLED=1 (or run clp-set-standby / clp-sync-control off)"
   fi
 
   mkdir -p "${CLP_SYNC_STATE_DIR}" "${CLP_SYNC_TMP_DIR}" "${CLP_SYNC_LOG_DIR}"

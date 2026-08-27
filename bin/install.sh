@@ -96,6 +96,9 @@ if [[ "${ROLE}" == "standby" ]]; then
   echo "On the MASTER, run the same installer, choose Master,"
   echo "and enter this host + token when asked."
   echo
+  echo "If the master is lost later, run on THIS server:"
+  echo "  /opt/clp-sync/bin/clp-promote"
+  echo
   if ask_yn "Start pairing listener now (waits for master)?" "y"; then
     echo
     c_info "Waiting for master to pair (up to 30 minutes)..."

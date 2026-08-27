@@ -26,7 +26,7 @@ Full walkthrough: **[Installation guide](docs/installation.md)**
 | [Architecture](docs/architecture.md) | How sync works, what runs where |
 | [Compatibility checks](docs/compatibility-checks.md) | Preflight and cross-host validation |
 | [Operations](docs/operations.md) | Daily commands, logs, manual sync |
-| [Failover](docs/failover.md) | Cutover runbook when the master fails |
+| [Failover](docs/failover.md) | Promote standby → master (`clp-promote`) |
 | [Uninstall](docs/uninstall.md) | Remove sync tooling without touching sites |
 
 ---
@@ -68,7 +68,10 @@ bin/
   clp-sync             Main sync orchestrator (master only)
   clp-bootstrap        First full clone (master only)
   clp-check            Compatibility checks
-  clp-failover-check   Pre-failover gate
+  clp-failover-check    Pre-failover gate
+  clp-promote           Promote standby → master after primary loss
+  clp-set-standby       Point master at a new standby after promotion
+  clp-sync-control      Enable/disable sync timer (on/off)
   clp-pair-listen      Standby pairing listener
 lib/                   Sync modules + checks
 systemd/               Timer (15 min, master only)

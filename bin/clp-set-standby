@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Configure a new standby on a promoted (or existing) master and enable sync.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+
+require_root
+configure_new_standby "${1:-}"

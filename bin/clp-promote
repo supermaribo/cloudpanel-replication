@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Promote standby → master after primary loss.
+# Run ON THE STANDBY when the master is down or unreachable.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+
+FORCE=0
+MAX_AGE=60
+
+usage() {
+  cat <<'EOF'
+Usage: clp-promote [options]
+
+Promote this STANDBY server to MASTER after the primary is lost.
+Blocks inbound sync from the old master and disables outbound sync
+until you configure a new standby (clp-set-standby).
+
+Options:
+  -y, --yes           Skip confirmation (still runs readiness checks)
+  --force             Skip readiness checks and confirmation
+  --max-age MINUTES   Max acceptable snapshot age (default: 60)
+  -h, --help          Show help
+
+After promotion:
+  1. Point DNS at this server
+  2. Run clp-set-standby when you have a new mirror target
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes) FORCE=1 ;;
+    --force) FORCE=1; MAX_AGE=99999 ;;
+    --max-age) MAX_AGE="$2"; shift 2; continue ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+
+require_root
+promote_standby_to_master "${FORCE}" "${MAX_AGE}"

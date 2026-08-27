@@ -106,6 +106,23 @@ with conn:
 
     conn.sendall(b"OK paired\n")
     print("Paired successfully with %s" % (addr[0],))
+    # Record master Tailscale IP for failover promotion
+    cfg = "/etc/clp-sync/config.env"
+    if os.path.exists(cfg):
+        master_ip = addr[0]
+        lines = open(cfg).read().splitlines()
+        out, found = [], False
+        for ln in lines:
+            if ln.startswith("PRIMARY_HOST="):
+                out.append("PRIMARY_HOST=%s" % master_ip)
+                found = True
+            else:
+                out.append(ln)
+        if not found:
+            out.append("PRIMARY_HOST=%s" % master_ip)
+        open(cfg, "w").write("\n".join(out) + "\n")
+        os.chmod(cfg, 0o600)
+    open("/var/lib/clp-sync/paired-from", "w").write(addr[0] + "\n")
     # Mark ready
     open("/var/lib/clp-sync/standby-ready", "w").write("paired\n")
     # Clear one-time token

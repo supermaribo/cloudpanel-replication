@@ -1,105 +1,101 @@
 # Failover runbook
 
-When the master fails or you need to switch traffic to the standby.
+When the master fails, promote the standby and switch traffic.
 
 ---
 
-## Before you need it
+## Quick failover (master lost)
 
-- [ ] Lower DNS TTL to 5 minutes a few days ahead
-- [ ] Know your standby's public IP
-- [ ] Test failover in maintenance window: `clp-failover-check 30`
-- [ ] Document which domains point to the master
-
----
-
-## Step 1 — Assess
-
-On a machine with access to the **master** config (or the master itself if still up):
+Run **on the standby**:
 
 ```bash
-/opt/clp-sync/bin/clp-failover-check 30
+/opt/clp-sync/bin/clp-promote
 ```
 
-This checks:
+Type `PROMOTE` when asked. This:
 
-- Last sync completed successfully
-- Last sync younger than 30 minutes (adjust argument as needed)
-- Standby SSH + nginx + MySQL up
-- Site counts match
+1. Verifies nginx, MySQL, and mirrored sites are ready
+2. Sets `ROLE=master` and `PROMOTED=1`
+3. **Blocks** inbound sync from the old master (removes sync SSH key)
+4. **Disables** outbound sync until you add a new standby
+5. Writes `/var/lib/clp-sync/promotion.json`
 
-**Do not fail over if checks fail** unless you accept data loss since last sync.
+Then point DNS / floating IP at the standby.
 
 ---
 
-## Step 2 — Freeze the master (if still reachable)
+## Step-by-step
+
+### 1 — Promote standby (on the standby server)
 
 ```bash
-systemctl stop clp-sync.timer
+# Optional: check mirror freshness first
+/opt/clp-sync/bin/clp-failover-check 30   # only if master still has last-status
+
+# Promote
+/opt/clp-sync/bin/clp-promote
+
+# Force (emergency, skip checks):
+# /opt/clp-sync/bin/clp-promote --force
 ```
 
-Optional — stop writes at the app layer:
+### 2 — Switch traffic
 
-- Put sites in maintenance mode
-- Stop nginx on master: `systemctl stop nginx`
-
----
-
-## Step 3 — Switch traffic
-
-Point DNS A/AAAA records (or floating IP) to the **standby's public IP**.
-
-Wait for TTL to propagate. Test with:
+Point DNS A/AAAA (or floating IP) to the **standby's public IP**.
 
 ```bash
 curl -I https://yourdomain.com
 dig +short yourdomain.com
 ```
 
-Or temporarily override on your machine:
+### 3 — Verify services
 
 ```bash
-# /etc/hosts
-STANDBY_PUBLIC_IP  yourdomain.com
+systemctl status nginx mysql
+clpctl --version
 ```
 
----
-
-## Step 4 — Verify on standby
-
-- Sites load over HTTP/HTTPS
-- CloudPanel admin login works (panel DB was mirrored)
-- SSL certificates should already be present (synced from master)
-
-If SSL issues:
+Renew SSL if needed (DNS must point here):
 
 ```bash
 clpctl lets-encrypt:install:certificate --domainName=example.com
 ```
 
-**Important:** LE renewals must come from the server DNS now points to.
+### 4 — Old master
+
+If the old master comes back:
+
+- **Do not** re-enable `clp-sync.timer` pointing at the promoted server
+- Run `./bin/uninstall.sh` on the old master, or leave it offline
+- Rebuild it later as a **new standby**
 
 ---
 
-## Step 5 — Promote standby
+## After promotion: new standby
 
-1. **Stop treating it as replica** — do not run sync from old master to this box
-2. **Disable sync on old master** if it comes back:
-   ```bash
-   systemctl disable --now clp-sync.timer
-   ```
-3. Operate the standby as your **new master**
-4. Rebuild or repair the old server as a **new standby** when ready
+When you have a rebuilt server:
+
+**On the new standby:** `./bin/install.sh` → Standby → pair
+
+**On the promoted master:**
+
+```bash
+/opt/clp-sync/bin/clp-set-standby
+# Enter new standby Tailscale name after pairing
+/opt/clp-sync/bin/clp-bootstrap
+```
 
 ---
 
-## Step 6 — Re-establish replication (later)
+## Sync toggle (master)
 
-When old master is rebuilt:
+Pause or resume replication without uninstalling:
 
-1. Fresh CloudPanel on old server
-2. Install clp-sync on **both** with roles reversed
-3. Bootstrap from new master → old server as standby
+```bash
+/opt/clp-sync/bin/clp-sync-control off    # pause sync
+/opt/clp-sync/bin/clp-sync-control on     # resume (needs STANDBY_HOST)
+/opt/clp-sync/bin/clp-sync-control status
+```
 
 ---
 
@@ -108,21 +104,16 @@ When old master is rebuilt:
 | Metric | Typical |
 |--------|---------|
 | **RPO** (max data loss) | Up to 15 minutes (last sync interval) |
-| **RTO** (time to switch) | DNS TTL + verification (~5–30 min) |
-
-For near-zero RPO, reduce timer interval in `systemd/clp-sync.timer` (e.g. `OnUnitActiveSec=5min`).
+| **RTO** (time to switch) | DNS TTL + `clp-promote` (~5–30 min) |
 
 ---
 
 ## Rollback
 
-If failover was a mistake and master is still good:
+If failover was a mistake and the original master is still good:
 
-1. Point DNS back to master
-2. Re-enable sync timer on master
-3. Run manual sync to refresh standby:
-   ```bash
-   /opt/clp-sync/bin/clp-sync
-   ```
+1. Point DNS back to original master
+2. On promoted server: `./bin/uninstall.sh` or re-run install as standby
+3. Re-bootstrap from original master
 
-**Warning:** Any writes on standby during failover may be overwritten by next sync from master.
+**Warning:** Writes on the promoted server during failover may be lost when re-syncing from the original master.

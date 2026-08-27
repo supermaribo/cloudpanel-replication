@@ -69,7 +69,15 @@ require_root
 load_config
 
 if [[ "${ROLE:-master}" == "standby" ]]; then
-  die "This host is ROLE=standby — run sync only on the master"
+  die "This host is ROLE=standby — run sync only on the master (or clp-promote after primary loss)"
+fi
+
+if [[ "${SYNC_ENABLED:-1}" != "1" ]]; then
+  die "Sync is disabled (SYNC_ENABLED=0). Enable with: clp-sync-control on  or configure standby: clp-set-standby"
+fi
+
+if [[ -z "${STANDBY_HOST:-}" ]]; then
+  die "No STANDBY_HOST configured — run clp-set-standby"
 fi
 
 : "${APPLY_PANEL_DB:=1}"

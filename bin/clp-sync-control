@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Enable or disable scheduled sync on the master.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: clp-sync-control <on|off|status>
+
+Toggle outbound sync on the master (systemd timer).
+
+  on      Enable sync timer
+  off     Disable sync timer (pause replication)
+  status  Show current setting
+EOF
+}
+
+require_root
+load_config 2>/dev/null || true
+
+ACTION="${1:-status}"
+
+case "${ACTION}" in
+  on|enable)
+    [[ "${ROLE:-master}" == "master" ]] || die "Only runs on master"
+    [[ -n "${STANDBY_HOST:-}" ]] || die "Set STANDBY_HOST first (clp-set-standby)"
+    toggle_sync on
+    ;;
+  off|disable)
+    toggle_sync off
+    ;;
+  status)
+    cfg="${CLP_SYNC_CONFIG:-/etc/clp-sync/config.env}"
+    if [[ -f "${cfg}" ]]; then
+      # shellcheck disable=SC1090
+      source "${cfg}"
+      echo "ROLE=${ROLE:-unknown}"
+      echo "SYNC_ENABLED=${SYNC_ENABLED:-1}"
+      echo "STANDBY_HOST=${STANDBY_HOST:-}"
+      echo "PROMOTED=${PROMOTED:-0}"
+      [[ "${PROMOTED:-0}" == "1" ]] && grep ^PROMOTED_AT= "${cfg}" || true
+      systemctl is-active clp-sync.timer 2>/dev/null || echo "timer=inactive"
+    else
+      echo "Not configured"
+    fi
+    ;;
+  *)
+    usage; exit 1
+    ;;
+esac
