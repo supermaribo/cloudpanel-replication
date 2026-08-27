@@ -13,33 +13,58 @@ inventory_snapshot() {
   echo "${dest}"
 }
 
-# Print pipe-separated sites:
-# id|domain_name|user|type|php_version|vhost_template|user_password
-# vhost_template in SQLite is often the FULL nginx config (newlines). Never emit that —
-# it would split this loop and skip remaining sites. Custom vhosts are copied via rsync.
+# Print tab-separated sites (never pipe-separated: vhost blobs contain newlines).
+# id, domain_name, user, type, php_version, vhost_template
 inventory_sites() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
-  sqlite3 -separator '|' "${db}" "
-SELECT
-  s.id,
-  replace(replace(s.domain_name, char(10), ''), char(13), ''),
-  replace(replace(s.user, char(10), ''), char(13), ''),
-  replace(replace(s.type, char(10), ''), char(13), ''),
-  COALESCE(p.php_version, ''),
-  CASE
-    WHEN s.vhost_template IS NULL OR trim(s.vhost_template) = '' THEN 'Generic'
-    WHEN instr(s.vhost_template, char(10)) > 0 THEN 'Generic'
-    WHEN s.vhost_template LIKE '#%' THEN 'Generic'
-    WHEN s.vhost_template LIKE '%server {%' THEN 'Generic'
-    WHEN s.vhost_template LIKE '%listen %' THEN 'Generic'
-    WHEN length(s.vhost_template) > 80 THEN 'Generic'
-    ELSE trim(s.vhost_template)
-  END,
-  ''
-FROM site s
-LEFT JOIN php_settings p ON p.site_id = s.id
-ORDER BY s.domain_name;
-"
+  python3 - "${db}" <<'PY'
+import sqlite3, sys
+db = sys.argv[1]
+con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
+
+def cols(table):
+    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+
+sc = cols("site")
+php_table = "php_settings" if "php_settings" in {
+    r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+} else None
+
+def pick(row, *names, default=""):
+    for n in names:
+        if n in row.keys() and row[n] is not None:
+            return str(row[n]).replace("\r", "").replace("\n", " ").replace("\t", " ")
+    return default
+
+type_map = {
+    "php": "php", "wordpress": "php", "woocommerce": "php",
+    "nodejs": "nodejs", "node": "nodejs", "node.js": "nodejs",
+    "python": "python",
+    "static": "static", "html": "static",
+    "reverse-proxy": "reverse-proxy", "reverse_proxy": "reverse-proxy",
+    "reverseproxy": "reverse-proxy",
+}
+
+php_by_site = {}
+if php_table:
+    try:
+        for r in con.execute("SELECT site_id, php_version FROM php_settings"):
+            if r[0] is not None and r[0] not in php_by_site:
+                php_by_site[r[0]] = r[1] or ""
+    except sqlite3.Error:
+        pass
+
+for row in con.execute("SELECT * FROM site ORDER BY id"):
+    sid = row["id"]
+    domain = pick(row, "domain_name", "domain")
+    user = pick(row, "user", "site_user", "username")
+    raw_type = pick(row, "type", "site_type").strip().lower()
+    site_type = type_map.get(raw_type, "php")
+    php_ver = str(php_by_site.get(sid, "") or "8.3")
+    # Never emit stored nginx; rsync copies real vhosts.
+    print("\t".join([str(sid), domain, user, site_type, php_ver, "Generic"]))
+PY
 }
 
 # ftp_user|home_directory|site_user
@@ -61,22 +86,39 @@ inventory_ftp_usernames() {
   sqlite3 "${db}" "SELECT DISTINCT user_name FROM ftp_user WHERE user_name IS NOT NULL AND user_name != '';" 2>/dev/null || true
 }
 
-# Print pipe-separated databases:
-# site_id|domain_name|site_user|db_name|db_user
 inventory_databases() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
-  sqlite3 -separator '|' "${db}" "
-SELECT
-  s.id,
-  s.domain_name,
-  s.user,
-  d.name,
-  COALESCE(du.user_name, '')
+  python3 - "${db}" <<'PY'
+import sqlite3, sys
+db = sys.argv[1]
+con = sqlite3.connect(db)
+tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+db_table = "database" if "database" in tables else ("databases" if "databases" in tables else None)
+if not db_table:
+    sys.exit(0)
+q = f'''
+SELECT s.id, s.domain_name, s.user, d.name, COALESCE(du.user_name, '')
 FROM site s
-JOIN database d ON d.site_id = s.id
+JOIN "{db_table}" d ON d.site_id = s.id
 LEFT JOIN database_user du ON du.database_id = d.id
-ORDER BY d.name;
-"
+ORDER BY d.name
+'''
+try:
+    for row in con.execute(q):
+        vals = [("" if x is None else str(x).replace("\t"," ").replace("\n"," ")) for x in row]
+        print("\t".join(vals))
+except sqlite3.Error:
+    # database_user table may be named differently
+    q2 = f'''
+    SELECT s.id, s.domain_name, s.user, d.name, d.name
+    FROM site s
+    JOIN "{db_table}" d ON d.site_id = s.id
+    ORDER BY d.name
+    '''
+    for row in con.execute(q2):
+        vals = [("" if x is None else str(x).replace("\t"," ").replace("\n"," ")) for x in row]
+        print("\t".join(vals))
+PY
 }
 
 # Print pipe-separated cron rows:
@@ -110,10 +152,15 @@ guess_db_password() {
   local site_user="$1" domain="$2" db_name="$3"
   local root="/home/${site_user}/htdocs/${domain}"
   local f pass
+  local search_root="/home/${site_user}/htdocs"
 
-  for f in "${root}/.env" "${root}/.env.local" "${root}/app/.env" "${root}/htdocs/.env" \
-           "${root}/public/../.env" \
-           "${root}/wp-config.php" "${root}/public/wp-config.php"; do
+  local env_files=()
+  [[ -d "${root}" ]] && env_files+=("${root}/.env" "${root}/.env.local" "${root}/app/.env")
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] && env_files+=("${f}")
+  done < <(find "${search_root}" -maxdepth 4 \( -name '.env' -o -name 'wp-config.php' \) 2>/dev/null | head -40)
+
+  for f in "${env_files[@]}"; do
     [[ -f "${f}" ]] || continue
     if [[ "${f}" == *wp-config.php ]]; then
       pass="$(grep -E "define\(\s*['\"]DB_PASSWORD['\"]" "${f}" 2>/dev/null \

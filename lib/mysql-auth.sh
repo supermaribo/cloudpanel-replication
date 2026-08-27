@@ -102,6 +102,20 @@ dump_database() {
   clpctl db:export --databaseName="${db_name}" --file="${dest}"
 }
 
+# Run a SQL string on the standby with CloudPanel MySQL credentials.
+remote_mysql_sql() {
+  local sql="$1"
+  local f="${CLP_SYNC_TMP_DIR}/remote-one.sql"
+  local rsync_ssh
+  rsync_ssh="$(rsync_ssh_cmd)"
+  printf '%s\n' "${sql}" >"${f}"
+  chmod 600 "${f}"
+  remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
+  rsync -a -e "${rsync_ssh}" "${f}" "$(standby_target):/var/tmp/clp-sync-import/remote-one.sql"
+  remote_mysql_file /var/tmp/clp-sync-import/remote-one.sql
+  remote "rm -f /var/tmp/clp-sync-import/remote-one.sql"
+}
+
 # Run a SQL file on the standby with that host's CloudPanel MySQL credentials.
 remote_mysql_file() {
   local remote_sql="$1"

@@ -22,7 +22,7 @@ sync_mysql() {
   local dump_file checksum_file old_sum new_sum remote_tmp fp old_fp
 
   log_info "Syncing MySQL databases (dump/import only if data changed)"
-  while IFS='|' read -r site_id domain site_user db_name db_user; do
+  while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     if _mysql_should_skip "${db_name}"; then
       continue
@@ -85,7 +85,7 @@ reconcile_db_passwords() {
   sql_file="${CLP_SYNC_TMP_DIR}/alter-user.sql"
 
   log_info "Reconciling MySQL user passwords on standby from app configs"
-  while IFS='|' read -r site_id domain site_user db_name db_user; do
+  while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" && -n "${db_user}" ]] || continue
     if _mysql_should_skip "${db_name}"; then
       continue
