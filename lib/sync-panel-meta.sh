@@ -56,6 +56,7 @@ sync_panel_data_files() {
   log_info "Syncing CloudPanel data directory ${data_dir}"
   remote "install -d -m 755 -o clp -g clp '${data_dir}'"
   rsync -a -e "${rsync_ssh}" \
+    --exclude 'db.sq3' \
     --exclude 'db.sq3-journal' \
     --exclude 'db.sq3-wal' \
     --exclude 'db.sq3-shm' \

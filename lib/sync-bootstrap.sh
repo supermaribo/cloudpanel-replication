@@ -157,53 +157,20 @@ EOS
 
 _clpctl_db_add() {
   local domain="$1" db_name="$2" db_user="$3" password="$4"
-  local logf="/var/tmp/clp-sync-import/db-add.log"
-  remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
-  remote bash -s -- "${domain}" "${db_name}" "${db_user}" "${password}" "${logf}" "${CLP_DB_PATH}" <<'EOS'
-set +e
-domain="$1"; db_name="$2"; db_user="$3"; password="$4"; logf="$5"; panel_db="$6"
-{
-  echo "==== env ===="
-  echo "clpctl=$(command -v clpctl)"
-  file "$(command -v clpctl)" 2>/dev/null || true
-  echo "tty=$(tty 2>/dev/null || true) script=$(command -v script || true)"
-  echo "==== panel sites ===="
-  sqlite3 "${panel_db}" "SELECT id, domain_name, user FROM site;" 2>/dev/null || true
-  echo "==== panel databases ===="
-  sqlite3 "${panel_db}" 'SELECT id, site_id, name FROM "database";' 2>/dev/null || true
-  echo "==== panel database_user ===="
-  sqlite3 "${panel_db}" 'SELECT id, database_id, user_name FROM database_user;' 2>/dev/null || true
-  echo "==== clpctl db:add ===="
-  echo "domain=${domain} db=${db_name} user=${db_user}"
-  export CLP_SYNC_DOMAIN="${domain}"
-  export CLP_SYNC_DB_NAME="${db_name}"
-  export CLP_SYNC_DB_USER="${db_user}"
-  export CLP_SYNC_DB_PASS="${password}"
-  add_sh='clpctl -vvv db:add --domainName="$CLP_SYNC_DOMAIN" --databaseName="$CLP_SYNC_DB_NAME" --databaseUserName="$CLP_SYNC_DB_USER" --databaseUserPassword="$CLP_SYNC_DB_PASS"'
-  if command -v script >/dev/null 2>&1; then
-    script -qefc "${add_sh}" /var/tmp/clp-sync-import/db-add.tty </dev/null
-    echo "EXIT=$?"
-    echo "==== tty capture ===="
-    cat /var/tmp/clp-sync-import/db-add.tty 2>/dev/null || true
-  else
-    eval "${add_sh}" </dev/null
-    echo "EXIT=$?"
-  fi
-  echo "==== cloudpanel php logs ===="
-  ls -lt /home/clp/htdocs/app/var/log 2>/dev/null | head -20
-  tail -n 40 /home/clp/htdocs/app/var/log/*.log 2>/dev/null || true
-} >"${logf}" 2>&1
-python3 - "${logf}" <<'PY'
-import re, sys
-p = sys.argv[1]
-t = open(p, errors="replace").read()
-t = re.sub(r"(databaseUserPassword[=: ]+)\S+", r"\1***", t)
-t = re.sub(r"(IDENTIFIED BY ')[^']*", r"\1***", t)
-open(p, "w").write(t)
-PY
-exit 0
-EOS
-  remote "cat ${logf}" || true
+  local rc out
+  # Same argv path as site:add. Do not pass -vvv: /usr/bin/clpctl is a bash
+  # wrapper that treats the first token as the command name.
+  set +e
+  out="$(remote clpctl db:add \
+    --domainName="${domain}" \
+    --databaseName="${db_name}" \
+    --databaseUserName="${db_user}" \
+    --databaseUserPassword="${password}" 2>&1)"
+  rc=$?
+  set -e
+  printf '%s\n' "${out}"
+  echo "EXIT=${rc}"
+  return 0
 }
 
 _standby_purge_panel_db_rows() {
@@ -324,21 +291,34 @@ bootstrap_database_on_standby() {
 run_bootstrap() {
   local db_snap="$1"
   local id domain user type php_ver vhost
-  local site_id domain_name site_user db_name db_user
-  local n db_fail=0
+  local n site_fail=0
 
   n="$(inventory_sites "${db_snap}" | grep -c . || true)"
-  log_info "Bootstrapping missing sites on standby (${n} site(s) in master inventory)"
+  log_info "Step 1/5: CloudPanel sites (${n} in master inventory)"
   while IFS=$'\t' read -r id domain user type php_ver vhost; do
+    domain="${domain//$'\r'/}"
+    user="${user//$'\r'/}"
     if [[ -z "${domain}" ]]; then
       log_warn "Skipping site id=${id:-?} user=${user:-?} (empty domain_name)"
       continue
     fi
     log_info "Inventory site: ${domain} user=${user} type=${type}"
-    bootstrap_site_on_standby "${domain}" "${user}" "${type}" "${php_ver}" "${vhost}"
+    if ! bootstrap_site_on_standby "${domain}" "${user}" "${type}" "${php_ver}" "${vhost}"; then
+      site_fail=$((site_fail + 1))
+    fi
   done < <(inventory_sites "${db_snap}")
+  if [[ "${site_fail}" -gt 0 ]]; then
+    log_warn "${site_fail} site(s) failed to create — continuing with remaining sync steps"
+  fi
+}
 
-  log_info "Bootstrapping missing databases on standby"
+run_bootstrap_databases() {
+  local db_snap="$1"
+  local site_id domain_name site_user db_name db_user
+  local db_fail=0 n
+
+  n="$(inventory_databases "${db_snap}" | grep -c . || true)"
+  log_info "Step 5/5: Databases (${n} in master inventory)"
   while IFS=$'\t' read -r site_id domain_name site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     if ! bootstrap_database_on_standby "${domain_name}" "${db_name}" "${db_user}" "${site_user}"; then
@@ -346,7 +326,7 @@ run_bootstrap() {
     fi
   done < <(inventory_databases "${db_snap}")
   if [[ "${db_fail}" -gt 0 ]]; then
-    log_error "${db_fail} database(s) failed to bootstrap on standby"
+    log_error "${db_fail} database(s) failed to provision on standby"
     return 1
   fi
 }

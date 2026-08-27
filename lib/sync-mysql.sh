@@ -22,6 +22,8 @@ sync_mysql() {
   local dump_file checksum_file old_sum new_sum remote_tmp fp old_fp
 
   log_info "Syncing MySQL databases (dump/import only if data changed)"
+  run_bootstrap_databases "${db_snap}" || true
+
   while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     if _mysql_should_skip "${db_name}"; then
@@ -44,6 +46,7 @@ sync_mysql() {
 
     log_info "Dumping ${db_name}"
     dump_database "${db_name}" "${dump_file}"
+    log_info "Dump ${db_name} ready ($(du -h "${dump_file}" 2>/dev/null | awk '{print $1}'))"
 
     new_sum="$(sha256_file "${dump_file}")"
     old_sum=""
@@ -56,22 +59,18 @@ sync_mysql() {
       continue
     fi
 
-    log_info "Importing ${db_name} on standby"
+    log_info "Copying dump and importing ${db_name} on standby via mysql"
     remote "mkdir -p /var/tmp/clp-sync-import && chmod 700 /var/tmp/clp-sync-import"
     rsync -a -e "${rsync_ssh}" "${dump_file}" "$(standby_target):${remote_tmp}"
 
-    if remote clpctl db:import --databaseName="${db_name}" --file="${remote_tmp}"; then
+    # clpctl db:import only works if the panel sqlite already has the database.
+    # Always import with the mysql client; panel UI is updated later via db.sq3.
+    if remote_mysql_import_gz "${db_name}" "${remote_tmp}"; then
       echo "${new_sum}" >"${checksum_file}"
       [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
       remote "rm -f '${remote_tmp}'"
       INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
       log_ok "Imported ${db_name}"
-    elif remote_mysql_import_gz "${db_name}" "${remote_tmp}"; then
-      echo "${new_sum}" >"${checksum_file}"
-      [[ -n "${fp:-}" ]] && save_checksum "mysql-fp-${db_name}" "${fp}"
-      remote "rm -f '${remote_tmp}'"
-      INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
-      log_ok "Imported ${db_name} via mysql client"
     else
       log_error "Import failed for ${db_name}"
       return 1

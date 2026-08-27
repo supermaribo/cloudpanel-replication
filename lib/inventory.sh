@@ -13,69 +13,61 @@ inventory_snapshot() {
   echo "${dest}"
 }
 
-# Print tab-separated sites (never pipe-separated: vhost blobs contain newlines).
+# Print tab-separated sites. Never SELECT vhost blobs (they contain newlines).
 # id, domain_name, user, type, php_version, vhost_template
 inventory_sites() {
   local db="${1:-${CLP_SYNC_TMP_DIR}/db.sq3}"
+  local out
+  out="$(sqlite3 -separator $'\t' "${db}" "
+SELECT
+  s.id,
+  COALESCE(s.domain_name, ''),
+  COALESCE(s.user, ''),
+  COALESCE(s.type, 'php'),
+  COALESCE((SELECT p.php_version FROM php_settings p WHERE p.site_id = s.id LIMIT 1), '8.3'),
+  'Generic'
+FROM site s
+ORDER BY s.id;
+" 2>/dev/null)" && { printf '%s\n' "${out}"; return 0; }
   python3 - "${db}" <<'PY'
-import re, sqlite3, sys
+import sqlite3, sys
 db = sys.argv[1]
 con = sqlite3.connect(db)
-con.row_factory = sqlite3.Row
+colset = {r[1] for r in con.execute("PRAGMA table_info(site)")}
 
-def cols(table):
-    return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-
-sc = cols("site")
-php_table = "php_settings" if "php_settings" in {
-    r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
-} else None
-
-def pick(row, *names, default=""):
-    keys = {str(k).lower(): k for k in row.keys()}
+def col(*names):
     for n in names:
-        k = keys.get(n.lower())
-        if k is None:
-            continue
-        v = row[k]
-        if v is None:
-            continue
-        s = str(v).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
-        if s:
-            return s
-    return default
+        if n in colset:
+            return n
+    return None
 
+idc, dc, uc, tc = col("id"), col("domain_name", "domain"), col("user", "site_user"), col("type", "site_type")
+if not idc:
+    sys.exit(0)
+fields = [c for c in (idc, dc, uc, tc) if c]
+q = "SELECT " + ", ".join(f'"{f}"' for f in fields) + " FROM site ORDER BY id"
 type_map = {
     "php": "php", "wordpress": "php", "woocommerce": "php",
     "nodejs": "nodejs", "node": "nodejs", "node.js": "nodejs",
-    "python": "python",
-    "static": "static", "html": "static",
+    "python": "python", "static": "static", "html": "static",
     "reverse-proxy": "reverse-proxy", "reverse_proxy": "reverse-proxy",
     "reverseproxy": "reverse-proxy",
 }
-
 php_by_site = {}
-if php_table:
-    try:
-        for r in con.execute("SELECT site_id, php_version FROM php_settings"):
-            if r[0] is not None and r[0] not in php_by_site:
-                php_by_site[r[0]] = r[1] or ""
-    except sqlite3.Error:
-        pass
-
-for row in con.execute("SELECT * FROM site ORDER BY id"):
-    sid = row["id"]
-    domain = pick(row, "domain_name", "domain", "domainName")
-    if not domain:
-        vt = pick(row, "vhost_template", "vhost", "nginx_vhost")
-        m = re.search(r"(?i)vhost for ([A-Za-z0-9.-]+)", vt)
-        if m:
-            domain = m.group(1)
-    user = pick(row, "user", "site_user", "username")
-    raw_type = pick(row, "type", "site_type").strip().lower()
+try:
+    for r in con.execute("SELECT site_id, php_version FROM php_settings"):
+        if r[0] is not None and r[0] not in php_by_site:
+            php_by_site[r[0]] = r[1] or ""
+except sqlite3.Error:
+    pass
+for row in con.execute(q):
+    m = {fields[i]: row[i] for i in range(len(fields))}
+    sid = m.get(idc)
+    domain = "" if not dc else ("" if m.get(dc) is None else str(m[dc]).replace("\n", " ").replace("\t", " ").strip())
+    user = "" if not uc else ("" if m.get(uc) is None else str(m[uc]).replace("\n", " ").replace("\t", " ").strip())
+    raw_type = ("" if not tc or m.get(tc) is None else str(m[tc]).strip().lower())
     site_type = type_map.get(raw_type, "php")
-    php_ver = str(php_by_site.get(sid, "") or "8.3").replace("\r", " ").replace("\n", " ").replace("\t", " ").strip() or "8.3"
-    # Never emit stored nginx; rsync copies real vhosts.
+    php_ver = str(php_by_site.get(sid, "") or "8.3").replace("\n", " ").strip() or "8.3"
     print("\t".join([str(sid), domain, user, site_type, php_ver, "Generic"]))
 PY
 }

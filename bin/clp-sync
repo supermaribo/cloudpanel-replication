@@ -127,10 +127,12 @@ if [[ "${SKIP_BOOTSTRAP}" -eq 0 ]]; then
 fi
 
 if [[ "${SKIP_USERS}" -eq 0 ]]; then
+  log_info "Step 2/5: Users, FTP, SSH"
   sync_ftp_users "${DB_SNAP}"
 fi
 
 if [[ "${SKIP_FILES}" -eq 0 ]]; then
+  log_info "Step 3/5: Site files"
   sync_site_files "${DB_SNAP}"
 fi
 
@@ -139,16 +141,18 @@ if [[ "${SKIP_USERS}" -eq 0 ]]; then
   sync_user_identities "${DB_SNAP}"
 fi
 
-if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
-  sync_mysql "${DB_SNAP}"
-fi
-
 if [[ "${SKIP_NGINX}" -eq 0 ]]; then
+  log_info "Step 4/5: Nginx, SSL, PHP-FPM, crons"
   sync_nginx_ssl
   sync_php_fpm_pools
   sync_crons "${DB_SNAP}"
 fi
 
+if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
+  sync_mysql "${DB_SNAP}"
+fi
+
+log_info "CloudPanel panel settings (sqlite last, after databases exist)"
 sync_panel_data_files
 sync_panel_meta "${DB_SNAP}"
 
