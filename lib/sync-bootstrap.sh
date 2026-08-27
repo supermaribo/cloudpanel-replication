@@ -36,12 +36,27 @@ bootstrap_site_on_standby() {
   [[ -n "${php_version}" ]] || php_version="8.3"
   vhost_template="Generic"
 
-  if remote "id -u $(printf '%q' "${site_user}") >/dev/null 2>&1"; then
+  # Earlier rsync can create /home/<user> before CloudPanel runs useradd -m, which then fails.
+  local home_stashed=0 add_rc=0
+  if remote bash -s -- "${site_user}" <<'EOS'
+set -euo pipefail
+u="$1"
+id -u "$u" >/dev/null 2>&1 && exit 1
+[[ -d "/home/${u}" ]] || exit 1
+mkdir -p /var/tmp/clp-sync-prehome
+rm -rf "/var/tmp/clp-sync-prehome/${u}"
+mv "/home/${u}" "/var/tmp/clp-sync-prehome/${u}"
+EOS
+  then
+    home_stashed=1
+    log_info "Moved existing /home/${site_user} aside so CloudPanel can create the user"
+  elif remote "id -u $(printf '%q' "${site_user}") >/dev/null 2>&1"; then
     log_warn "Linux user ${site_user} exists on standby but site ${domain} missing in panel"
   fi
 
   log_info "Creating ${site_type} site on standby: ${domain} (user=${site_user})"
 
+  set +e
   case "${site_type}" in
     php)
       remote clpctl site:add:php \
@@ -50,6 +65,7 @@ bootstrap_site_on_standby() {
         --vhostTemplate="Generic" \
         --siteUser="${site_user}" \
         --siteUserPassword="${password}"
+      add_rc=$?
       ;;
     nodejs)
       remote clpctl site:add:nodejs \
@@ -58,6 +74,7 @@ bootstrap_site_on_standby() {
         --siteUserPassword="${password}" \
         --nodejsVersion=22 \
         --appPort=3000
+      add_rc=$?
       ;;
     python)
       remote clpctl site:add:python \
@@ -66,12 +83,14 @@ bootstrap_site_on_standby() {
         --siteUserPassword="${password}" \
         --pythonVersion=3.12 \
         --appPort=8080
+      add_rc=$?
       ;;
     static)
       remote clpctl site:add:static \
         --domainName="${domain}" \
         --siteUser="${site_user}" \
         --siteUserPassword="${password}"
+      add_rc=$?
       ;;
     reverse-proxy)
       remote clpctl site:add:reverse-proxy \
@@ -79,12 +98,37 @@ bootstrap_site_on_standby() {
         --siteUser="${site_user}" \
         --siteUserPassword="${password}" \
         --reverseProxyUrl="http://127.0.0.1:8080"
+      add_rc=$?
       ;;
     *)
+      set -e
       log_warn "No bootstrap handler for type=${site_type} domain=${domain}"
       return 0
       ;;
   esac
+  set -e
+
+  if [[ "${home_stashed}" -eq 1 ]]; then
+    remote bash -s -- "${site_user}" <<'EOS'
+set -euo pipefail
+u="$1"
+pre="/var/tmp/clp-sync-prehome/${u}"
+home="/home/${u}"
+if [[ -d "${pre}" ]]; then
+  mkdir -p "${home}"
+  rsync -a "${pre}/" "${home}/"
+  if id -u "$u" >/dev/null 2>&1; then
+    chown -R "${u}:${u}" "${home}" 2>/dev/null || true
+  fi
+  rm -rf "${pre}"
+fi
+EOS
+  fi
+
+  if [[ "${add_rc}" -ne 0 ]]; then
+    log_error "clpctl site:add failed for ${domain} (exit ${add_rc})"
+    return "${add_rc}"
+  fi
 
   log_ok "Created site ${domain} on standby"
 }
