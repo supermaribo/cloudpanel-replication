@@ -94,7 +94,7 @@ install_files() {
     --exclude 'config.env' \
     "${INSTALL_SRC}/" "${INSTALL_DEST}/"
   chmod 755 "${INSTALL_DEST}/bin/"* 2>/dev/null || true
-  chmod -p /etc/clp-sync /var/lib/clp-sync /var/log/clp-sync /var/tmp/clp-sync
+  mkdir -p /etc/clp-sync /var/lib/clp-sync /var/log/clp-sync /var/tmp/clp-sync
   chmod 700 /etc/clp-sync /var/lib/clp-sync /var/tmp/clp-sync
   c_ok "Files installed"
 }

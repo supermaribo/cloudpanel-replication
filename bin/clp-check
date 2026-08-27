@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Run compatibility / preflight checks.
+# Usage:
+#   clp-check local [master|standby]
+#   clp-check peer          (master: compare with standby over SSH)
+#   clp-check sync          (master: quick pre-sync check)
+#   clp-check all           (master: local + peer)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/checks.sh
+source "${ROOT}/lib/checks.sh"
+
+MODE="${1:-all}"
+ROLE="${2:-}"
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run as root" >&2
+  exit 1
+fi
+
+# Load config if present (for peer/sync modes)
+if [[ -f /etc/clp-sync/config.env ]]; then
+  # shellcheck disable=SC1091
+  set -a; source /etc/clp-sync/config.env; set +a
+fi
+if [[ -z "${ROLE}" && -f /etc/clp-sync/role ]]; then
+  ROLE="$(tr -d '[:space:]' </etc/clp-sync/role)"
+fi
+ROLE="${ROLE:-master}"
+
+case "${MODE}" in
+  local)
+    checks_reset
+    run_local_preflight "${ROLE}"
+    ;;
+  peer)
+    if [[ "${ROLE}" != "master" ]]; then
+      echo "Peer checks run from master only" >&2
+      exit 1
+    fi
+    # shellcheck source=../lib/common.sh
+    source "${ROOT}/lib/common.sh"
+    load_config
+    checks_reset
+    run_local_preflight master || true
+    run_peer_compatibility master
+    ;;
+  sync)
+    # shellcheck source=../lib/common.sh
+    source "${ROOT}/lib/common.sh"
+    load_config
+    run_sync_preflight
+    ;;
+  all)
+    if [[ "${ROLE}" == "standby" ]]; then
+      checks_reset
+      run_local_preflight standby
+      exit $?
+    fi
+    # shellcheck source=../lib/common.sh
+    source "${ROOT}/lib/common.sh"
+    load_config
+    checks_reset
+    run_local_preflight master || true
+    run_peer_compatibility master
+    ;;
+  *)
+    cat <<EOF
+Usage: clp-check [local|peer|sync|all] [master|standby]
+
+  local   Checks this server only
+  peer    Master: compare with standby (needs SSH + config)
+  sync    Master: quick check before a sync run
+  all     Master: local + peer (default on master)
+EOF
+    exit 1
+    ;;
+esac

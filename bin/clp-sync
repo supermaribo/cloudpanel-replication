@@ -19,12 +19,15 @@ source "${ROOT}/lib/sync-nginx-ssl.sh"
 source "${ROOT}/lib/sync-panel-meta.sh"
 # shellcheck source=../lib/sync-users.sh
 source "${ROOT}/lib/sync-users.sh"
+# shellcheck source=../lib/checks.sh
+source "${ROOT}/lib/checks.sh"
 
 SKIP_BOOTSTRAP=0
 SKIP_FILES=0
 SKIP_MYSQL=0
 SKIP_NGINX=0
 SKIP_USERS=0
+SKIP_CHECKS=0
 DRY_CONNECT_ONLY=0
 
 usage() {
@@ -41,6 +44,7 @@ Options:
   --skip-mysql       Skip MySQL dump/import
   --skip-nginx       Skip nginx/SSL/PHP-FPM/cron sync
   --skip-users       Skip Linux password/SSH identity + FTP provisioning
+  --skip-checks      Skip pre-sync compatibility checks
   --connect-only     Only test SSH to standby, then exit
   -h, --help         Show help
 EOF
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --skip-mysql) SKIP_MYSQL=1 ;;
     --skip-nginx) SKIP_NGINX=1 ;;
     --skip-users) SKIP_USERS=1 ;;
+    --skip-checks) SKIP_CHECKS=1 ;;
     --connect-only) DRY_CONNECT_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
@@ -86,9 +91,17 @@ trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status fa
 require_cmds ssh rsync sqlite3 flock openssl
 log_info "clp-sync starting (full mirror) → ${STANDBY_HOST}"
 
-log_info "Testing SSH to standby"
-if ! remote "echo ok && command -v clpctl && command -v sqlite3 && command -v nginx"; then
-  die "Cannot reach standby or missing clpctl/sqlite3/nginx"
+if [[ "${SKIP_CHECKS}" -eq 0 ]]; then
+  log_info "Running pre-sync compatibility checks"
+  if ! run_sync_preflight; then
+    die "Preflight checks failed (use --skip-checks to override)"
+  fi
+else
+  log_warn "Skipping pre-sync checks (--skip-checks)"
+  log_info "Testing SSH to standby"
+  if ! remote "echo ok && command -v clpctl && command -v sqlite3 && command -v nginx"; then
+    die "Cannot reach standby or missing clpctl/sqlite3/nginx"
+  fi
 fi
 
 if [[ "${DRY_CONNECT_ONLY}" -eq 1 ]]; then

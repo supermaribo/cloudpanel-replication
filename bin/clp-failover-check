@@ -5,6 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/checks.sh
+source "${ROOT}/lib/checks.sh"
 
 MAX_AGE_MINUTES="${1:-30}"
 
@@ -54,11 +56,9 @@ else
 fi
 
 echo
-echo "--- standby connectivity ---"
-if remote "systemctl is-active nginx >/dev/null 2>&1 || systemctl is-active cloudpanel-nginx >/dev/null 2>&1; systemctl is-active mysql >/dev/null 2>&1 || systemctl is-active mariadb >/dev/null 2>&1; echo nginx_mysql_ok"; then
-  echo "OK: standby SSH + nginx/mysql appear up"
-else
-  echo "FAIL: standby health check failed"
+echo "--- compatibility ---"
+checks_reset
+if ! run_sync_preflight; then
   FAIL=1
 fi
 

@@ -7,6 +7,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../lib/install-common.sh
 source "${ROOT}/lib/install-common.sh"
+# shellcheck source=../lib/checks.sh
+source "${ROOT}/lib/checks.sh"
 
 require_root_install
 
@@ -55,6 +57,15 @@ case "${ROLE_CHOICE}" in
 esac
 
 install_files
+
+c_info "Running compatibility checks on this ${ROLE}..."
+checks_reset
+if ! run_local_preflight "${ROLE}"; then
+  c_err "Local compatibility checks failed."
+  if ! ask_yn "Continue anyway (not recommended)?" "n"; then
+    exit 1
+  fi
+fi
 
 # --------------------------------------------------------------------------
 # STANDBY
@@ -183,6 +194,19 @@ if ! ssh -i "${SSH_KEY}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o
   exit 1
 fi
 c_ok "Standby reachable"
+
+c_info "Cross-host compatibility checks..."
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# Populate remote() using config we just wrote
+load_config
+checks_reset
+if ! run_peer_compatibility master; then
+  c_err "Master ↔ standby compatibility checks failed."
+  if ! ask_yn "Continue with bootstrap anyway (not recommended)?" "n"; then
+    exit 1
+  fi
+fi
 
 echo
 if ask_yn "Run first full clone (bootstrap) now? This only writes to the standby." "y"; then

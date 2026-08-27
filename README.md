@@ -20,8 +20,16 @@ sudo ./bin/install.sh
 
 - Choose **1) Master**
 - Enter the standby host + token from step 1
-- Installer pairs SSH, then can bootstrap + enable the 15‑minute timer
-- Confirms: **no CloudPanel site changes on the master**
+- Installer runs **compatibility checks** on both hosts (OS, CloudPanel, PHP versions, disk, services)
+- Then pairs SSH, bootstrap, and optional 15‑minute timer
+
+Run checks anytime:
+
+```bash
+/opt/clp-sync/bin/clp-check all      # full local + cross-host
+/opt/clp-sync/bin/clp-check local standby
+/opt/clp-sync/bin/clp-check sync     # before each sync (automatic)
+```
 
 ## What is mirrored
 
