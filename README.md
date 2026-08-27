@@ -1,139 +1,84 @@
 # CloudPanel Hot Standby Sync
 
-One-way **identical mirror** from a live CloudPanel **master** to a **standby** over **Tailscale**. Interactive installer on **both** machines; they pair with a one-time token. Sync is **read-only on the master** (only the standby is written).
+One-way **identical mirror** from a live CloudPanel **master** to a **hot standby** over **Tailscale**. An interactive installer runs on **both** servers; they link with a one-time pairing token. Sync is **read-only on the master** — only the standby is written.
+
+**Repository:** https://github.com/supermaribo/cloudpanel-replication
 
 ---
 
-## Install from scratch
+## Quick start
 
-### Before you start
+| Step | Server | Command |
+|------|--------|---------|
+| 1 | Standby (new CloudPanel) | `git clone … && sudo ./bin/install.sh` → choose **Standby** |
+| 2 | Master (live CloudPanel) | `git clone … && sudo ./bin/install.sh` → choose **Master** |
+| 3 | Master | Verify with `clp-check all` and `clp-failover-check 30` |
 
-| Requirement | Master | Standby |
-|-------------|--------|---------|
-| Ubuntu + CloudPanel (same major version) | Your live server | Fresh/empty install |
-| Tailscale on same tailnet | Yes | Yes |
-| Root SSH | Outbound to standby | Inbound from master |
-
----
-
-### Step 1 — Prepare the standby (new server)
-
-1. Install Ubuntu and **CloudPanel** (match the master’s CloudPanel version).
-2. Confirm Tailscale is up: `tailscale status`
-3. **Do not** create sites on the standby — the master will clone them.
+Full walkthrough: **[Installation guide](docs/installation.md)**
 
 ---
 
-### Step 2 — Install on the **standby first**
+## Documentation
 
-```bash
-git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
-cd /root/clp-sync-src
-sudo ./bin/install.sh
-```
-
-- Choose **2) Standby**
-- Compatibility checks run on this server
-- **Write down** the **Tailscale name/IP** and **pairing token**
-- Say **Y** to start the pairing listener and **leave it running**
-
----
-
-### Step 3 — Install on the **master** (live server)
-
-```bash
-git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
-cd /root/clp-sync-src
-sudo ./bin/install.sh
-```
-
-- Choose **1) Master**
-- Pick the standby from the Tailscale peer list (or type its name/IP)
-- Enter the **pairing token** from step 2
-- Installer pairs SSH, runs **cross-host compatibility checks**, then asks:
-  - Run first full clone? → **Y**
-  - Enable 15-minute sync timer? → **Y**
-
-Master CloudPanel data is **read-only** — sites/DBs/users on the master are not modified.
-
----
-
-### Step 4 — Verify
-
-On the **master**:
-
-```bash
-/opt/clp-sync/bin/clp-check all
-/opt/clp-sync/bin/clp-failover-check 30
-journalctl -u clp-sync.service -n 50 --no-pager
-systemctl list-timers clp-sync.timer
-```
+| Guide | Description |
+|-------|-------------|
+| [Installation](docs/installation.md) | Install from scratch (standby first, then master) |
+| [Architecture](docs/architecture.md) | How sync works, what runs where |
+| [Compatibility checks](docs/compatibility-checks.md) | Preflight and cross-host validation |
+| [Operations](docs/operations.md) | Daily commands, logs, manual sync |
+| [Failover](docs/failover.md) | Cutover runbook when the master fails |
+| [Uninstall](docs/uninstall.md) | Remove sync tooling without touching sites |
 
 ---
 
 ## What is mirrored
 
-| Layer | How |
-|-------|-----|
-| Site files | rsync (includes SSH keys, SSL under homes) |
-| Linux / FTP / `clp` users | password hashes, shells, groups |
-| SSL / Let's Encrypt | nginx certs + related ACME paths |
-| PHP-FPM pools, nginx, crons | mirrored |
-| MySQL | dump/import; skip unchanged |
-| CloudPanel panel DB | applied on standby |
+| Layer | Method |
+|-------|--------|
+| Site files (`/home/<user>/`) | rsync (includes `.ssh`, SSL under homes) |
+| Linux / FTP / `clp` users | Password hashes, shells, groups |
+| SSL / Let's Encrypt | nginx certs, ACME-related paths |
+| Nginx + PHP-FPM pools | Config sync + reload |
+| MySQL databases | Dump/import; skip unchanged dumps |
+| Cron jobs | `/etc/cron.d/<siteUser>` |
+| CloudPanel panel DB | Live `db.sq3` applied on standby |
 
-**Not mirrored:** SSH host keys, Tailscale identity, public IP/hostname.
+**Not mirrored:** SSH host keys, Tailscale identity, public IP/hostname, root `authorized_keys` (except the sync key added at pair time).
 
-**RPO:** ~15 minutes. **Failover:** point DNS/IP at standby.
-
----
-
-## Useful commands
-
-```bash
-# Manual sync (master)
-/opt/clp-sync/bin/clp-sync
-
-# Compatibility checks
-/opt/clp-sync/bin/clp-check all
-/opt/clp-sync/bin/clp-check sync
-
-# Pre-failover
-/opt/clp-sync/bin/clp-failover-check 30
-
-# Logs
-journalctl -u clp-sync.service -f
-```
+**RPO:** up to ~15 minutes · **Failover:** manual DNS or floating IP
 
 ---
 
-## Uninstall
+## Requirements
 
-Removes the sync agent only — **not** CloudPanel, sites, or databases.
+- Two Ubuntu servers with **CloudPanel** (same major version)
+- Both on the **same Tailscale tailnet**
+- Root SSH from master → standby over Tailscale
+- Master packages: `rsync`, `sqlite3`, `mysqldump`, `openssl`, `python3`
+- Standby: `clpctl`, nginx, MySQL/MariaDB, `openssh-server`
 
-### On the master
+---
 
-```bash
-cd /root/clp-sync-src   # or wherever you cloned
-sudo ./bin/uninstall.sh
+## Project layout
+
+```
+bin/
+  install.sh           Interactive installer (both roles)
+  uninstall.sh         Remove sync agent
+  clp-sync             Main sync orchestrator (master only)
+  clp-bootstrap        First full clone (master only)
+  clp-check            Compatibility checks
+  clp-failover-check   Pre-failover gate
+  clp-pair-listen      Standby pairing listener
+lib/                   Sync modules + checks
+systemd/               Timer (15 min, master only)
+config.example.env     Template (real config → /etc/clp-sync/config.env)
 ```
 
-### On the standby
+Installed to `/opt/clp-sync` on both servers. Only the **master** runs the sync timer.
 
-```bash
-cd /root/clp-sync-src
-sudo ./bin/uninstall.sh
-```
+---
 
-Non-interactive:
+## License
 
-```bash
-sudo ./bin/uninstall.sh -y
-```
-
-Options:
-
-- `--keep-key` — keep `/root/.ssh/clp_sync_ed25519` on master
-- `--keep-src` — keep the git clone directory
-
-After uninstall on the **standby**, mirrored sites and data remain on disk — only the sync tooling is removed.
+Use at your own risk. Test on non-production systems first.
