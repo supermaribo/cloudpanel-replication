@@ -2,7 +2,29 @@
 
 One-way **identical mirror** from a live CloudPanel **master** to a **standby** over **Tailscale**. Interactive installer on **both** machines; they pair with a one-time token. Sync is **read-only on the master** (only the standby is written).
 
-## Install (both servers)
+---
+
+## Install from scratch
+
+### Before you start
+
+| Requirement | Master | Standby |
+|-------------|--------|---------|
+| Ubuntu + CloudPanel (same major version) | Your live server | Fresh/empty install |
+| Tailscale on same tailnet | Yes | Yes |
+| Root SSH | Outbound to standby | Inbound from master |
+
+---
+
+### Step 1 — Prepare the standby (new server)
+
+1. Install Ubuntu and **CloudPanel** (match the master’s CloudPanel version).
+2. Confirm Tailscale is up: `tailscale status`
+3. **Do not** create sites on the standby — the master will clone them.
+
+---
+
+### Step 2 — Install on the **standby first**
 
 ```bash
 git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
@@ -10,26 +32,44 @@ cd /root/clp-sync-src
 sudo ./bin/install.sh
 ```
 
-### 1) Standby first
-
 - Choose **2) Standby**
-- Note the **Tailscale name/IP** and **pairing token**
-- Leave the pairing listener running (or start it when prompted)
+- Compatibility checks run on this server
+- **Write down** the **Tailscale name/IP** and **pairing token**
+- Say **Y** to start the pairing listener and **leave it running**
 
-### 2) Master second
+---
 
-- Choose **1) Master**
-- Enter the standby host + token from step 1
-- Installer runs **compatibility checks** on both hosts (OS, CloudPanel, PHP versions, disk, services)
-- Then pairs SSH, bootstrap, and optional 15‑minute timer
-
-Run checks anytime:
+### Step 3 — Install on the **master** (live server)
 
 ```bash
-/opt/clp-sync/bin/clp-check all      # full local + cross-host
-/opt/clp-sync/bin/clp-check local standby
-/opt/clp-sync/bin/clp-check sync     # before each sync (automatic)
+git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sync-src
+cd /root/clp-sync-src
+sudo ./bin/install.sh
 ```
+
+- Choose **1) Master**
+- Pick the standby from the Tailscale peer list (or type its name/IP)
+- Enter the **pairing token** from step 2
+- Installer pairs SSH, runs **cross-host compatibility checks**, then asks:
+  - Run first full clone? → **Y**
+  - Enable 15-minute sync timer? → **Y**
+
+Master CloudPanel data is **read-only** — sites/DBs/users on the master are not modified.
+
+---
+
+### Step 4 — Verify
+
+On the **master**:
+
+```bash
+/opt/clp-sync/bin/clp-check all
+/opt/clp-sync/bin/clp-failover-check 30
+journalctl -u clp-sync.service -n 50 --no-pager
+systemctl list-timers clp-sync.timer
+```
+
+---
 
 ## What is mirrored
 
@@ -42,22 +82,58 @@ Run checks anytime:
 | MySQL | dump/import; skip unchanged |
 | CloudPanel panel DB | applied on standby |
 
-**Not mirrored:** SSH host keys, Tailscale identity, public IP/hostname, root `authorized_keys` (except the sync key added at pair time).
+**Not mirrored:** SSH host keys, Tailscale identity, public IP/hostname.
 
 **RPO:** ~15 minutes. **Failover:** point DNS/IP at standby.
 
-## Checks
+---
+
+## Useful commands
 
 ```bash
-# on master
+# Manual sync (master)
+/opt/clp-sync/bin/clp-sync
+
+# Compatibility checks
+/opt/clp-sync/bin/clp-check all
+/opt/clp-sync/bin/clp-check sync
+
+# Pre-failover
 /opt/clp-sync/bin/clp-failover-check 30
+
+# Logs
 journalctl -u clp-sync.service -f
 ```
 
-## Uninstall (master)
+---
+
+## Uninstall
+
+Removes the sync agent only — **not** CloudPanel, sites, or databases.
+
+### On the master
 
 ```bash
-systemctl disable --now clp-sync.timer
-rm -f /etc/systemd/system/clp-sync.service /etc/systemd/system/clp-sync.timer
-systemctl daemon-reload
+cd /root/clp-sync-src   # or wherever you cloned
+sudo ./bin/uninstall.sh
 ```
+
+### On the standby
+
+```bash
+cd /root/clp-sync-src
+sudo ./bin/uninstall.sh
+```
+
+Non-interactive:
+
+```bash
+sudo ./bin/uninstall.sh -y
+```
+
+Options:
+
+- `--keep-key` — keep `/root/.ssh/clp_sync_ed25519` on master
+- `--keep-src` — keep the git clone directory
+
+After uninstall on the **standby**, mirrored sites and data remain on disk — only the sync tooling is removed.
