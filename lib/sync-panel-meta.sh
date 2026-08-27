@@ -146,13 +146,24 @@ rm -rf /home/clp/htdocs/app/var/cache/* 2>/dev/null
 mkdir -p /home/clp/htdocs/app/var/cache /home/clp/htdocs/app/var/log
 chown -R clp:clp /home/clp/htdocs/app/var /home/clp/htdocs/app/data /home/clp/htdocs/app/.env /home/clp/htdocs/app/files/.env 2>/dev/null
 chmod 660 /home/clp/htdocs/app/data/db.sq3 2>/dev/null
-for s in php*-fpm; do
+for s in php*-fpm clp-php-fpm; do
   systemctl reload "$s" 2>/dev/null || systemctl restart "$s" 2>/dev/null
 done
 echo "==== panel error log ===="
 ls -lt /home/clp/htdocs/app/var/log 2>/dev/null | head -10
-tail -n 40 /home/clp/htdocs/app/var/log/prod.log 2>/dev/null
-tail -n 20 /home/clp/logs/nginx/error.log 2>/dev/null
+tail -n 80 /home/clp/htdocs/app/var/log/prod.log 2>/dev/null
+echo "==== dashboard probe ===="
+for url in \
+  https://127.0.0.1:8443/dashboard \
+  https://127.0.0.1/dashboard \
+  http://127.0.0.1:8443/dashboard
+do
+  echo "GET $url"
+  curl -skI --max-time 12 -o /tmp/clp-dash.hdr -w "http=%{http_code} time=%{time_total}\n" "$url"
+  head -n 15 /tmp/clp-dash.hdr 2>/dev/null
+done
+echo "==== latest exception ===="
+grep -iE 'critical|error|exception|decrypt|aws|defuse' /home/clp/htdocs/app/var/log/prod.log 2>/dev/null | tail -n 40
 true
 EOS
 }
@@ -164,7 +175,10 @@ sync_panel_app_secret() {
   rsync_ssh="$(rsync_ssh_cmd)"
 
   log_info "Aligning CloudPanel APP_SECRET on standby with master"
-  remote "mkdir -p /home/clp/htdocs/app /home/clp/htdocs/app/files"
+  # Drop compiled env on standby first — it overrides .env and causes /dashboard 500
+  # when the sqlite was encrypted with the master's secret.
+  remote "rm -f /home/clp/htdocs/app/.env.local.php /home/clp/htdocs/app/files/.env.local.php"
+  remote "mkdir -p /home/clp/htdocs/app /home/clp/htdocs/app/files /home/clp/htdocs/app/config/secrets /home/clp/htdocs/app/files/config/secrets"
   for f in \
     /home/clp/htdocs/app/.env \
     /home/clp/htdocs/app/.env.local \
@@ -177,6 +191,15 @@ sync_panel_app_secret() {
     if [[ -f "${f}" ]]; then
       rsync -a -e "${rsync_ssh}" "${f}" "$(standby_target):${f}"
       log_info "Copied ${f} to standby"
+    fi
+  done
+  for d in \
+    /home/clp/htdocs/app/config/secrets \
+    /home/clp/htdocs/app/files/config/secrets
+  do
+    if [[ -d "${d}" ]]; then
+      rsync -a -e "${rsync_ssh}" "${d}/" "$(standby_target):${d}/"
+      log_info "Copied ${d} to standby"
     fi
   done
 
@@ -309,14 +332,14 @@ sync_panel_accounts() {
 # Keep backup destinations/credentials in the panel DB and rclone configs.
 # Only stop the jobs from running on the standby (master already backs up).
 disable_standby_backups() {
-  log_info "Disabling CloudPanel backup jobs on standby (credentials kept)"
-  remote bash -s <<'EOS'
+  log_info "Disabling CloudPanel backup jobs and Remote Backup on standby (credentials kept)"
+  remote bash -s -- "${CLP_DB_PATH}" <<'EOS'
 set -euo pipefail
-python3 - <<'PY'
-import pathlib, re
+python3 - "$1" <<'PY'
+import pathlib, re, sqlite3, subprocess, sys
 
 MARKER = "# clp-sync: backups disabled on standby — credentials/settings kept; re-enable on promote\n"
-JOB_RE = re.compile(r"db:backup|remote-backup|\brclone\b", re.I)
+JOB_RE = re.compile(r"db:backup|remote-backup|\brclone\b|create_backup\.sh", re.I)
 
 def disable(path: pathlib.Path) -> bool:
     if not path.is_file():
@@ -359,8 +382,6 @@ for p in (
     except OSError as e:
         print("skip", p, e)
 
-# crontab of clp / clp-admin if they have backup lines
-import os, subprocess, tempfile
 for user in ("clp", "clp-admin"):
     try:
         current = subprocess.check_output(["crontab", "-u", user, "-l"], text=True, stderr=subprocess.DEVNULL)
@@ -389,9 +410,43 @@ for user in ("clp", "clp-admin"):
 
 if not changed:
     print("no active backup jobs to disable")
+
+COL_RE = re.compile(
+    r"(remote[_ ]?backup|is_remote_backup|enable[_ ]?remote[_ ]?backup|"
+    r"remote[_ ]?backup[_ ]?enabled)",
+    re.I,
+)
+TABLE_RE = re.compile(r"backup|rclone", re.I)
+KV_KEY = re.compile(r"remote.?backup|enable.?remote|automatic.?backup", re.I)
+try:
+    con = sqlite3.connect(sys.argv[1])
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    print("panel tables", ",".join(sorted(tables)))
+    for table in tables:
+        names = [c[1] for c in con.execute(f'PRAGMA table_info("{table}")')]
+        targets = [n for n in names if COL_RE.search(n)]
+        if not targets and TABLE_RE.search(table):
+            targets = [n for n in names if re.search(r"(^enabled$|^is_enabled$|^active$)", n, re.I)]
+        if targets:
+            sets = ", ".join(f'"{n}" = 0' for n in targets)
+            con.execute(f'UPDATE "{table}" SET {sets}')
+            print("sqlite remote-backup off", table, ",".join(targets))
+        keycol = next((n for n in names if n.lower() in ("name", "key", "setting_key", "option")), None)
+        valcol = next((n for n in names if n.lower() in ("value", "setting_value", "data")), None)
+        if keycol and valcol:
+            for (k,) in con.execute(f'SELECT "{keycol}" FROM "{table}"'):
+                if k and KV_KEY.search(str(k)):
+                    con.execute(
+                        f'UPDATE "{table}" SET "{valcol}" = ? WHERE "{keycol}" = ?',
+                        ("0", k),
+                    )
+                    print("sqlite kv remote-backup off", table, k)
+    con.commit()
+except sqlite3.Error as e:
+    print("sqlite remote-backup skip", e)
 PY
 EOS
-  log_ok "Standby backup jobs disabled (S3/local credentials unchanged)"
+  log_ok "Standby Remote Backup disabled (credentials kept, jobs off)"
 }
 
 # Copying master's panel DB would re-enable AWS "Automatic Images" on the
