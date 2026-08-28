@@ -102,6 +102,7 @@ fi
 
 apply_panel_db_local "${DB_SNAP}"
 disable_local_backup_jobs
+ensure_php_services
 
 DURATION="$(( $(date +%s) - START_TS ))"
 write_status ok "duration_s=${DURATION}"

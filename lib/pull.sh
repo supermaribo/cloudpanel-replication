@@ -82,11 +82,23 @@ pull_nginx_php() {
       mkdir -p "${u}/logs/nginx"
     done
     nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
-    for s in php*-fpm; do
+    ensure_php_services
+    for s in php*-fpm clp-php-fpm; do
       systemctl reload "$s" 2>/dev/null || true
     done
   fi
   log_ok "Nginx/PHP pulled"
+}
+
+ensure_php_services() {
+  systemctl start clp-php-fpm 2>/dev/null || true
+  local unit
+  shopt -s nullglob
+  for unit in /lib/systemd/system/php*-fpm.service /usr/lib/systemd/system/php*-fpm.service; do
+    [[ -f "${unit}" ]] || continue
+    systemctl start "$(basename "${unit}" .service)" 2>/dev/null || true
+  done
+  shopt -u nullglob
 }
 
 apply_panel_db_local() {
@@ -94,12 +106,9 @@ apply_panel_db_local() {
   local dest="${CLP_DB_PATH}"
   [[ "${APPLY_PANEL_DB}" == "1" ]] || return 0
   log_info "Applying panel sqlite locally"
-  local units
-  units="$(systemctl list-units --type=service --state=running --no-legend 2>/dev/null \
-    | awk '{print $1}' | grep -E 'php[0-9.]*-fpm|clp-php-fpm' || true)"
   local s
-  for s in ${units}; do
-    systemctl stop "${s}" || true
+  for s in clp-php-fpm php7.4-fpm php8.0-fpm php8.1-fpm php8.2-fpm php8.3-fpm php8.4-fpm php8.5-fpm; do
+    systemctl stop "${s}" 2>/dev/null || true
   done
   rm -f "${dest}-wal" "${dest}-shm" "${dest}-journal"
   cp -a "${src}" "${dest}.new"
@@ -107,9 +116,7 @@ apply_panel_db_local() {
   chmod 660 "${dest}.new"
   mv -f "${dest}.new" "${dest}"
   rm -f "${dest}-wal" "${dest}-shm" "${dest}-journal"
-  for s in ${units}; do
-    systemctl start "${s}" || true
-  done
+  ensure_php_services
   local n
   n="$(sqlite3 "${src}" 'SELECT COUNT(*) FROM user;' 2>/dev/null || echo 0)"
   log_ok "Panel sqlite applied (${n} user(s))"
