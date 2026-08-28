@@ -12,8 +12,9 @@ Complete install from scratch for a **live CloudPanel master** and a **new stand
   install-full.sh                install-full.sh
   choose: 2                        choose: 1
   pairing token ───────────────► enter token
-  listener running               bootstrap + timer
+  listener / pull key            clp-allow-pull
                                  read-only on master
+                                 timer runs on standby
 ```
 
 ---
@@ -26,7 +27,7 @@ Complete install from scratch for a **live CloudPanel master** and a **new stand
 |---|--------|---------|
 | **Purpose** | Live production CloudPanel | Empty mirror target |
 | **CloudPanel** | In use with sites | Fresh install, **no sites** |
-| **Sync timer** | Yes (15 min) | No |
+| **Sync timer** | No | Yes (default 1h) |
 | **Written to** | Sync logs/state only | Full mirror |
 
 ### Prerequisites

@@ -65,8 +65,8 @@ sudo ./install-full.sh
 install-full.sh          ← start here (clone + interactive setup)
 bin/install.sh           Interactive installer (both roles)
 bin/uninstall.sh         Remove sync agent
-bin/clp-sync             Scheduled / manual sync (master)
-bin/clp-bootstrap        First full clone (master)
+bin/clp-sync             Replica pull (timer + Sync now)
+bin/clp-tune             Manual PHP-FPM / OPcache caps (live)
 bin/clp-check            Compatibility checks
 bin/clp-promote          Standby → master failover
 bin/clp-set-standby      Add new standby after promotion

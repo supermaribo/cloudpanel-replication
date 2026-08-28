@@ -67,28 +67,30 @@ sudo ./bin/uninstall.sh --keep-key --keep-src
 
 ---
 
-## Sync (master only)
+## Sync (replica)
 
 ### `clp-sync`
 
-Main replication run. Read-only on master.
+Replica pull from live. Live only allows the restricted SSH key.
 
 ```bash
-/opt/clp-sync/bin/clp-sync
-/opt/clp-sync/bin/clp-sync --connect-only
+sudo /opt/clp-sync/bin/clp-sync --manual
+sudo /opt/clp-sync/bin/clp-sync --connect-only
+sudo /opt/clp-sync/bin/clp-sync --resources
 ```
+
+`--resources` is read-only (RAM, running PHP-FPM, pool `pm.max_children`, InnoDB buffer pool). It works on **live or replica** and does not start a pull.
 
 | Flag | Effect |
 |------|--------|
-| `--skip-bootstrap` | Don't create missing sites on standby |
 | `--skip-files` | Skip file rsync |
 | `--skip-mysql` | Skip database dump/import |
 | `--skip-nginx` | Skip nginx/SSL/PHP-FPM/crons |
-| `--skip-users` | Skip user password / FTP sync |
-| `--skip-checks` | Skip preflight (emergency) |
-| `--connect-only` | Test SSH only |
+| `--connect-only` | Probe master SSH, then exit |
+| `--resources` | Read-only RAM / PHP-FPM / MySQL snapshot (live or replica) |
+| `--manual` | Run even if the timer is off (Sync now) |
 
-Runs automatically every **15 minutes** via `clp-sync.timer` on master.
+Timer: `clp-sync.timer` on the **replica** (default 1h). CloudPanel **Sync now** runs `clp-sync --manual`. Does **not** run `clp-tune`.
 
 ---
 
@@ -112,6 +114,20 @@ Pause or resume scheduled sync.
 /opt/clp-sync/bin/clp-sync-control status
 /opt/clp-sync/bin/clp-sync-control off
 /opt/clp-sync/bin/clp-sync-control on
+```
+
+---
+
+### `clp-tune`
+
+Apply agreed PHP-FPM / OPcache values (`ondemand`, `max_children=100`, idle 5s, OPcache 256 / JIT 32M / 100000 files). Stops unused `php*-fpm`. **Does not change MySQL.** **Manual only** — scheduled/manual `clp-sync` never runs this. Dry-run by default; pull the toolkit from the replica, run `--apply` on **live**, then Sync now on the replica.
+
+```bash
+sudo rsync -a --exclude config.env --exclude '.git/' \
+  root@<replica-tailscale>:/opt/clp-sync/ /opt/clp-sync/
+sudo chmod 755 /opt/clp-sync/bin/*
+sudo /opt/clp-sync/bin/clp-tune
+sudo /opt/clp-sync/bin/clp-tune --apply
 ```
 
 ---
@@ -183,6 +199,44 @@ Pair new standby with `install.sh` first, then run bootstrap.
 
 ---
 
+### `clp-sync-ui`
+
+Privileged helper for the replica CloudPanel badge (`share/clp-sync.php`). Not run by hand unless debugging.
+
+```bash
+sudo /opt/clp-sync/bin/clp-sync-ui <token> now
+sudo /opt/clp-sync/bin/clp-sync-ui <token> frequency 12h
+sudo /opt/clp-sync/bin/clp-sync-ui <token> live LIVE
+```
+
+---
+
+### `clp-allow-pull`
+
+**On live.** Authorize the replica’s SSH public key with `command=/opt/clp-sync/bin/clp-master-read-only`.
+
+```bash
+sudo /opt/clp-sync/bin/clp-allow-pull 'ssh-ed25519 AAAA… clp-sync-standby'
+```
+
+---
+
+### `clp-master-read-only`
+
+Forced SSH command on live. Not invoked directly. Allows rsync send, panel sqlite snapshot, site mysqldump, service list. Refuses shell and rsync receive.
+
+---
+
+### `clp-role` / `clp-pair-peer`
+
+Role swap helpers used by Make live and pairing.
+
+```bash
+sudo /opt/clp-sync/bin/clp-pair-peer <peer-tailscale-host>
+```
+
+---
+
 ## Standby pairing
 
 ### `clp-pair-listen`
@@ -196,7 +250,7 @@ Accept master SSH key during initial setup (usually started by installer).
 
 ---
 
-## Systemd (master)
+## Systemd (replica)
 
 ```bash
 systemctl enable --now clp-sync.timer
@@ -220,11 +274,14 @@ Key config keys:
 
 ```bash
 ROLE=master|standby
-STANDBY_HOST=tailscale-name-or-ip
+MASTER_HOST=live-tailscale-name
+PEER_HOST=other-host
 SYNC_ENABLED=1|0
+SYNC_INTERVAL=1h
 PROMOTED=0|1
-STANDBY_SSH_KEY=/root/.ssh/clp_sync_ed25519
+MASTER_SSH_KEY=/root/.ssh/clp_sync_ed25519
 APPLY_PANEL_DB=1
+MYSQL_SKIP_UNCHANGED=1
 ```
 
 ---
@@ -233,21 +290,21 @@ APPLY_PANEL_DB=1
 
 ### Fresh install
 
-1. Standby: `install-full.sh` → role 2 → save token
-2. Master: `install-full.sh` → role 1 → bootstrap + timer
-3. Master: `clp-check all`
+1. Master: `install-full.sh` → role master → `clp-allow-pull`
+2. Standby: `install-full.sh` → role standby → `clp-sync --manual`
+3. Replica: `clp-sync-control on` (timer)
 
 ### Master failure
 
-1. Standby: `clp-promote`
-2. DNS → standby
-3. Later: new standby + `clp-set-standby` + `clp-bootstrap`
+1. Point DNS at the replica
+2. Replica: Make live / `clp-promote`
+3. Pair so the old live becomes the new replica
 
 ### Maintenance pause
 
-1. Master: `clp-sync-control off`
-2. Work on master
-3. Master: `clp-sync-control on`
+1. Replica: `clp-sync-control off`
+2. Work on live
+3. Replica: `clp-sync-control on`
 
 ### Full removal
 

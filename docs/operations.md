@@ -2,6 +2,8 @@
 
 Day-to-day management of CloudPanel hot-standby sync.
 
+The **replica pulls**. Live only answers a restricted SSH key. PHP-FPM/OPcache caps (`clp-tune`) are **manual** and never run as part of sync.
+
 ---
 
 ## Installed paths
@@ -16,100 +18,144 @@ Day-to-day management of CloudPanel hot-standby sync.
 
 ---
 
-## Common commands (master)
+## Common commands (replica)
 
 ```bash
-# Manual full sync
-/opt/clp-sync/bin/clp-sync
+# Probe live SSH
+sudo /opt/clp-sync/bin/clp-sync --connect-only
 
-# First-time or re-provision missing sites on standby
-/opt/clp-sync/bin/clp-bootstrap
+# Sync now (same as CloudPanel “Sync now”)
+sudo /opt/clp-sync/bin/clp-sync --manual
 
-# Test SSH to standby only
-/opt/clp-sync/bin/clp-sync --connect-only
+# RAM / PHP-FPM snapshot (live or replica; no writes)
+sudo /opt/clp-sync/bin/clp-sync --resources
 
-# Full compatibility report
-/opt/clp-sync/bin/clp-check all
-
-# Pre-failover readiness (on master)
-/opt/clp-sync/bin/clp-failover-check 30
-
-# Pause / resume sync
-/opt/clp-sync/bin/clp-sync-control off
-/opt/clp-sync/bin/clp-sync-control on
-/opt/clp-sync/bin/clp-sync-control status
+# Pause / resume / interval
+sudo /opt/clp-sync/bin/clp-sync-control off
+sudo /opt/clp-sync/bin/clp-sync-control on
+sudo /opt/clp-sync/bin/clp-sync-control interval 12h
+sudo /opt/clp-sync/bin/clp-sync-control status
 ```
 
-## Failover commands (standby → master)
+## Failover (replica → live)
 
 ```bash
-# On STANDBY when master is lost
-/opt/clp-sync/bin/clp-promote
-
-# After promotion — add a new standby
-/opt/clp-sync/bin/clp-set-standby
-/opt/clp-sync/bin/clp-bootstrap
+# After DNS is pointed here
+sudo /opt/clp-sync/bin/clp-promote
 ```
 
-See [Failover guide](failover.md).
+Or use **Make live** in the replica CloudPanel UI (type `LIVE`). See [Failover](failover.md).
 
 ---
 
 ## Sync timer
 
+The timer runs on the **replica**, not on live.
+
 ```bash
-# Status
 systemctl list-timers clp-sync.timer
-
-# Enable
 systemctl enable --now clp-sync.timer
-
-# Disable (e.g. before maintenance)
 systemctl disable --now clp-sync.timer
-
-# Logs
 journalctl -u clp-sync.service -f
 journalctl -u clp-sync.service -n 100 --no-pager
 ```
 
-Default interval: **every 15 minutes** after boot (5 min initial delay).
+Default unit interval: **1 hour** after the last run (5 min after boot). The replica CloudPanel badge can set **1h / 2h / 4h / 6h / 12h / 24h / off**.
+
+---
+
+## Updating the toolkit
+
+Code lives in `/opt/clp-sync`. Config stays in `/etc/clp-sync/config.env` (never overwrite that).
+
+From **live**, pull the toolkit from the replica:
+
+```bash
+sudo rsync -a --exclude config.env --exclude '.git/' \
+  root@<replica-tailscale>:/opt/clp-sync/ /opt/clp-sync/
+sudo chmod 755 /opt/clp-sync/bin/*
+```
 
 ---
 
 ## Skip options (advanced)
 
 ```bash
-/opt/clp-sync/bin/clp-sync --skip-bootstrap
-/opt/clp-sync/bin/clp-sync --skip-files
-/opt/clp-sync/bin/clp-sync --skip-mysql
-/opt/clp-sync/bin/clp-sync --skip-nginx
-/opt/clp-sync/bin/clp-sync --skip-users
-/opt/clp-sync/bin/clp-sync --skip-checks
+sudo /opt/clp-sync/bin/clp-sync --manual --skip-files
+sudo /opt/clp-sync/bin/clp-sync --manual --skip-mysql
+sudo /opt/clp-sync/bin/clp-sync --manual --skip-nginx
+sudo /opt/clp-sync/bin/clp-sync --connect-only
 ```
 
 ---
 
 ## Configuration
 
-Edit `/etc/clp-sync/config.env`:
+Edit `/etc/clp-sync/config.env` on the replica:
 
 ```bash
-STANDBY_HOST=standby-tailscale-name
-STANDBY_SSH_KEY=/root/.ssh/clp_sync_ed25519
+ROLE=standby
+MASTER_HOST=live-tailscale-name
+MASTER_SSH_KEY=/root/.ssh/clp_sync_ed25519
 APPLY_PANEL_DB=1
 MYSQL_SKIP_UNCHANGED=1
+SYNC_INTERVAL=1h
 FAIL_NOTIFY_CMD=    # optional webhook, e.g. curl to ntfy
 ```
 
-After changes, no restart needed — next timer run picks up config.
+After changes, no restart needed — next timer or Sync now picks up config.
 
 ---
 
 ## Excludes
 
-Edit `/opt/clp-sync/excludes/rsync-excludes.txt` to skip caches, logs, etc.
+Edit `/opt/clp-sync/excludes/rsync-excludes.txt` to skip logs and temp files.
+
+Site homes copy **everything else** (including Laravel `bootstrap/cache` and web caches). Logs and `tmp/` are not copied; empty log files are created on the replica so nginx/PHP can write locally.
+
+Ownership is rewritten to the site user (`rsync --chown=user:user`); file **modes** stay as on live. Do not `chmod -R` a site home (that would break `.ssh`).
 
 **Note:** `.ssh/` is **included** (mirrored) so site SSH access matches master.
+
+---
+
+## How long a sync takes
+
+Most of the time is **MySQL import on the replica** when a database actually changed. Unchanged databases skip the load. The replica:
+
+- Dumps from live over Tailscale as the site DB user (read-only)
+- Relaxes InnoDB flush and turns **redo logging off for that import only**, then turns it back on
+- Skips rsync of `php*-fpm` versions that no site uses (for example 7.1–8.4 when sites are on 8.5)
+
+Files + nginx are typically tens of seconds. A full run with two changed databases used to take ~400s on a 2 GiB LXC because every InnoDB commit fsynced; import speedup is replica-only and does not change live MySQL.
+
+---
+
+## RAM, PHP-FPM, and high demand
+
+The replica **mirrors live** PHP-FPM / nginx settings so failover is not a surprise. Do not detune the replica. Change pools in **CloudPanel on live**; the next pull copies them.
+
+Read-only snapshot (safe on live or replica, no config writes):
+
+```bash
+sudo /opt/clp-sync/bin/clp-sync --resources
+```
+
+To **apply** caps on LIVE (does not touch MySQL). This is **manual only** — `clp-sync` never runs it. Pull the toolkit from the replica first, dry-run, then apply:
+
+```bash
+sudo rsync -a --exclude config.env --exclude '.git/' \
+  root@<replica-tailscale>:/opt/clp-sync/ /opt/clp-sync/
+sudo chmod 755 /opt/clp-sync/bin/*
+sudo /opt/clp-sync/bin/clp-tune
+sudo /opt/clp-sync/bin/clp-tune --apply
+```
+
+Then Sync now on the replica so it matches. If you later save a vhost in the CloudPanel UI, keep these OPcache values.
+
+`clp-tune` sets `pm=ondemand`, `pm.max_children=100`, idle timeout 5s, `pm.max_requests=300`, OPcache 256M / JIT 32M / 100000 files, and stops `php*-fpm` versions with no sites (never `clp-php-fpm`). MySQL is left alone.
+
+The replica already stops unused `php*-fpm`, leaves Varnish off when live is off, and disables CloudPanel backup cron while it is standby.
 
 ---
 
@@ -126,18 +172,15 @@ FAIL_NOTIFY_CMD='curl -fsS -d "clp-sync failed on $(hostname)" https://ntfy.sh/y
 ## Rules of operation
 
 1. **One-way only** — never edit live site content on the standby while it is the replica
-2. **Master is source of truth** — all changes happen on master, sync propagates
-3. **Don't run sync on standby** — `ROLE=standby` blocks `clp-sync`
+2. **Master is source of truth** — all changes happen on live; the replica pulls
+3. **`clp-sync` runs on the replica** — live only allows the restricted pull key
 4. **Keep CloudPanel versions matched** between master and standby
+5. **`clp-tune` is opt-in** — run it when you want FPM/OPcache caps, not on every sync
 
 ---
 
 ## Reversing roles
 
-After failover, to sync in the opposite direction:
-
-1. Uninstall clp-sync on both (or at least reconfigure roles)
-2. Install on the **new** master pointing at the rebuilt standby
-3. Bootstrap + enable timer
+Use **Make live** on the replica (or `clp-promote`) after DNS. Pairing (`clp-pair-peer`) lets the old live become the new replica.
 
 See [Failover](failover.md).

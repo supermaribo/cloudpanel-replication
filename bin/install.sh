@@ -43,9 +43,9 @@ echo "============================================"
 echo "  CloudPanel Hot-Standby Sync Installer"
 echo "============================================"
 echo
-echo "Install on BOTH servers over Tailscale."
-echo "  • Master  = live CloudPanel (restricted SSH read key only — no timer)"
-echo "  • Standby = puller (rsync + mysqldump + local import)"
+echo "Install on BOTH servers over Tailscale. Same code; role is in config."
+echo "  • Master  = LIVE (restricted SSH so the replica can pull; no timer)"
+echo "  • Standby = replica (pulls on a timer; Make live swaps roles)"
 echo
 
 if ! command -v tailscale >/dev/null 2>&1; then
@@ -167,6 +167,7 @@ if [[ "${ROLE}" == "standby" ]]; then
   echo
   echo "On the MASTER run:"
   echo "  sudo /opt/clp-sync/bin/clp-allow-pull '$(cat "${SSH_KEY}.pub")'"
+  echo "  sudo /opt/clp-sync/bin/clp-pair-peer $(tailscale_self_name 2>/dev/null || hostname)"
   echo
   echo "Then on THIS standby:"
   echo "  sudo /opt/clp-sync/bin/clp-sync --connect-only"
@@ -178,33 +179,71 @@ if [[ "${ROLE}" == "standby" ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# MASTER — restricted SSH wrapper only (no timer, no dumps on disk)
+# MASTER — restricted SSH wrapper (timer installed, left off)
 # --------------------------------------------------------------------------
 verify_master_tools || exit 1
 
-c_info "Master install: CloudPanel is READ-ONLY"
-echo "  Adds: /opt/clp-sync wrapper + optional pull key. No timer. No mysqldump files."
+c_info "Master install: CloudPanel is READ-ONLY for sync"
+echo "  Adds: /opt/clp-sync wrapper + pull key (for later role swap). No dumps on disk."
 
-write_config master "" ""
-systemctl disable --now clp-sync.timer 2>/dev/null || true
-rm -f /etc/systemd/system/clp-sync.timer /etc/systemd/system/clp-sync.service
-systemctl daemon-reload 2>/dev/null || true
-
-chmod 755 "${INSTALL_DEST}/bin/clp-master-read-only" "${INSTALL_DEST}/bin/clp-allow-pull"
+SSH_KEY=/root/.ssh/clp_sync_ed25519
+ensure_pull_key "${SSH_KEY}"
 
 echo
-if ask_yn "Paste the standby public key now (clp-allow-pull)?" "n"; then
-  ask "Standby public key line" ""
+echo "Online Tailscale peers (pick the replica):"
+mapfile -t PEERS < <(tailscale_peers)
+if ((${#PEERS[@]})); then
+  i=1
+  for line in "${PEERS[@]}"; do
+    name="${line%%$'\t'*}"
+    ip="${line#*$'\t'}"
+    printf "  %d) %s  (%s)\n" "${i}" "${name}" "${ip}"
+    i=$((i + 1))
+  done
+else
+  c_warn "No online peers — enter replica name/IP manually (or leave blank)."
+fi
+ask "Replica Tailscale name, 100.x IP, peer number, or empty" ""
+PEER_HOST="${REPLY}"
+if [[ "${PEER_HOST}" =~ ^[0-9]+$ ]] && ((${#PEERS[@]})) && [[ "${PEER_HOST}" -ge 1 && "${PEER_HOST}" -le ${#PEERS[@]} ]]; then
+  line="${PEERS[$((PEER_HOST - 1))]}"
+  name="${line%%$'\t'*}"
+  ip="${line#*$'\t'}"
+  PEER_HOST="${name:-${ip}}"
+fi
+
+write_config master "${PEER_HOST}" "${SSH_KEY}"
+
+install -m 644 "${INSTALL_DEST}/systemd/clp-sync.service" /etc/systemd/system/clp-sync.service
+install -m 644 "${INSTALL_DEST}/systemd/clp-sync.timer" /etc/systemd/system/clp-sync.timer
+systemctl daemon-reload
+systemctl disable --now clp-sync.timer 2>/dev/null || true
+
+chmod 755 "${INSTALL_DEST}/bin/"*
+
+echo
+if ask_yn "Paste the replica public key now (clp-allow-pull)?" "n"; then
+  ask "Replica public key line" ""
   [[ -n "${REPLY}" ]] && "${INSTALL_DEST}/bin/clp-allow-pull" "${REPLY}"
 fi
 
+"${INSTALL_DEST}/bin/clp-role" stamp-live 2>/dev/null || true
+
 echo
 echo "============================================"
-echo "  MASTER SOURCE READY"
+echo "  MASTER SOURCE READY (LIVE)"
 echo "============================================"
 echo
-echo "  This host does not run sync. The standby pulls over SSH."
+echo "  This host does not pull. The replica pulls over SSH."
 echo "  Authorize a key:  sudo /opt/clp-sync/bin/clp-allow-pull 'ssh-ed25519 AAAA…'"
+echo "  This host public key (authorize ON the replica for role swap):"
+echo "  $(cat "${SSH_KEY}.pub")"
+if [[ -n "${PEER_HOST}" ]]; then
+  echo
+  echo "  On the replica run:"
+  echo "    sudo /opt/clp-sync/bin/clp-allow-pull '$(cat "${SSH_KEY}.pub")'"
+  echo "    sudo /opt/clp-sync/bin/clp-pair-peer $(tailscale_self_name 2>/dev/null || hostname)"
+fi
 echo "  Remove:           sudo /opt/clp-sync/bin/uninstall.sh -y"
 echo
 exit 0

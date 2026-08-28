@@ -44,15 +44,15 @@ curl -fsSL https://raw.githubusercontent.com/supermaribo/cloudpanel-replication/
 | Standby host | Tailscale name or IP from step 1 |
 | Pairing token | Paste from step 1 |
 | Run bootstrap? | `Y` |
-| Enable 15-min timer? | `Y` |
+| Enable replica timer? | `Y` (default 1h; change later in CloudPanel) |
 
 ---
 
-## 3 — Verify (master)
+## 3 — Verify (replica)
 
 ```bash
-/opt/clp-sync/bin/clp-check all
-/opt/clp-sync/bin/clp-failover-check 30
+sudo /opt/clp-sync/bin/clp-sync --connect-only
+sudo /opt/clp-sync/bin/clp-sync --manual
 journalctl -u clp-sync.service -n 20 --no-pager
 ```
 
@@ -72,11 +72,11 @@ Then point DNS at the standby. Details: [Failover](failover.md).
 
 ## Pause sync
 
-On the **master**:
+On the **replica**:
 
 ```bash
-/opt/clp-sync/bin/clp-sync-control off
-/opt/clp-sync/bin/clp-sync-control on
+sudo /opt/clp-sync/bin/clp-sync-control off
+sudo /opt/clp-sync/bin/clp-sync-control on
 ```
 
 ---

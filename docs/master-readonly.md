@@ -39,8 +39,10 @@ These paths are **outside** CloudPanel and are safe to remove with `uninstall.sh
 
 - Site files under `/home/<user>/`
 - MySQL databases via `mysqldump`
-- `/etc/nginx/` configs (as rsync source)
+- `/etc/nginx/` configs (as rsync source), including `nginx.conf` / `php.ini`
+- Site-user crontabs (`clp-sync-crontabs`)
 - `/home/clp/htdocs/app/data/db.sq3` via SQLite `.backup`
+- `/etc/php/*/fpm/php.ini` and `conf.d`
 - `/etc/shadow` (password hashes exported to standby)
 
 Temp files written locally: `/var/tmp/clp-sync/` dumps only.

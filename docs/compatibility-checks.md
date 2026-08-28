@@ -11,7 +11,7 @@ Preflight validation ensures master and standby can sync safely.
 | `./bin/install.sh` | Local checks on each server |
 | `./bin/install.sh` (master, after pair) | Full cross-host comparison |
 | `clp-bootstrap` | Full checks (must pass) |
-| `clp-sync` (every 15 min) | Quick pre-sync check |
+| `clp-sync` (replica timer) | Pull run |
 | `clp-failover-check` | Sync freshness + compatibility |
 
 Override in emergencies: `clp-sync --skip-checks` (not recommended).

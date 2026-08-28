@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Role helper used locally and from the restricted SSH wrapper.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+# shellcheck source=../lib/inventory.sh
+source "${ROOT}/lib/inventory.sh"
+# shellcheck source=../lib/pull.sh
+source "${ROOT}/lib/pull.sh"
+
+usage() {
+  echo "Usage: clp-role become-standby|resume-pull|become-live|stamp-live|pair-peer <host>" >&2
+  exit 1
+}
+
+require_root
+ACTION="${1:-}"
+[[ -n "${ACTION}" ]] || usage
+load_config
+
+case "${ACTION}" in
+  become-standby) become_standby ;;
+  resume-pull) resume_pull ;;
+  become-live) become_live "${2:-0}" ;;
+  stamp-live) ensure_live_badge ;;
+  pair-peer)
+    pair_this_host_with "${2:-}"
+    ;;
+  *) usage ;;
+esac

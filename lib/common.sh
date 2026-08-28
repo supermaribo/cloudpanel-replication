@@ -65,13 +65,20 @@ load_config() {
   : "${APPLY_PANEL_DB:=1}"
   : "${SYNC_EXTRA_USERS:=clp}"
   : "${FAIL_NOTIFY_CMD:=}"
+  : "${DISPLAY_TZ:=Europe/London}"
   : "${PRIMARY_HOST:=}"
   : "${STANDBY_HOST:=}"
+  : "${PEER_HOST:=${STANDBY_HOST:-${MASTER_HOST:-}}}"
   : "${SYNC_ENABLED:=1}"
   : "${SYNC_AUTO:=0}"
+  : "${SYNC_INTERVAL:=1h}"
   : "${PROMOTED:=0}"
   : "${FORMER_PRIMARY_HOST:=}"
   : "${PROMOTED_AT:=}"
+
+  if [[ "${ROLE}" == "standby" && -z "${MASTER_HOST}" && -n "${PEER_HOST}" ]]; then
+    MASTER_HOST="${PEER_HOST}"
+  fi
 
   if [[ "${ROLE}" == "standby" && "${SYNC_ENABLED}" == "1" && -z "${MASTER_HOST}" ]]; then
     die "MASTER_HOST required for ROLE=standby (the live CloudPanel to pull from)"
@@ -122,7 +129,7 @@ rsync_from_master() {
   mkdir -p "${CLP_SYNC_TMP_DIR}" "$(dirname "${dest}")"
   RSYNC_CHANGED=0
 
-  rsync -aHAX --delete --omit-dir-times \
+  rsync -aHAX -z --delete --omit-dir-times \
     --out-format='%i %n%L' \
     -e "${rsync_ssh}" \
     "$@" \
@@ -146,6 +153,24 @@ rsync_from_master() {
   INC_SKIPPED=$((INC_SKIPPED + 1))
   log_info "pull ${src}: unchanged"
   return 0
+}
+
+last_sync_age_minutes() {
+  python3 - <<'PY'
+import time
+from pathlib import Path
+now = time.time()
+best = 0.0
+st = Path("/var/lib/clp-sync/last-status")
+if st.is_file():
+    text = st.read_text(errors="replace")
+    if "status=ok" in text or "status=OK" in text:
+        best = max(best, st.stat().st_mtime)
+snap = Path("/var/lib/clp-sync/primary-db.sq3")
+if snap.is_file():
+    best = max(best, snap.stat().st_mtime)
+print(int((now - best) / 60) if best else 99999)
+PY
 }
 
 write_status() {

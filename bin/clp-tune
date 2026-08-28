@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Apply agreed CloudPanel PHP-FPM / OPcache values. Never writes MySQL.
+# Manual only — clp-sync / the timer never invoke this.
+# Dry-run by default. Run --apply on LIVE, then Sync now on the replica.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+
+APPLY=0
+STOP_UNUSED=1
+
+usage() {
+  cat <<'EOF'
+Usage: clp-tune [--apply] [--keep-unused-php]
+
+  Agreed values (ondemand, max_children=100, idle 5s, max_requests=300,
+  opcache 256 / JIT 32M / files 100000). Stops php*-fpm with no site pools.
+  Never touches MySQL or clp-php-fpm. Not run by clp-sync; only when you call it.
+
+  --apply              Write files, nginx -t, reload, stop unused PHP-FPM
+  --keep-unused-php    Do not stop php*-fpm versions with no sites
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --keep-unused-php) STOP_UNUSED=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+  shift
+done
+
+require_root
+ROLE="unknown"
+if [[ -f /etc/clp-sync/role ]]; then
+  ROLE="$(tr -d '[:space:]' </etc/clp-sync/role)"
+elif [[ -f /etc/clp-sync/config.env ]]; then
+  # shellcheck disable=SC1091
+  ROLE="$(. /etc/clp-sync/config.env; echo "${ROLE:-unknown}")"
+fi
+
+python3 - "${APPLY}" "${STOP_UNUSED}" "${ROLE}" <<'PY'
+import glob, os, re, shutil, subprocess, sys, time
+
+apply = sys.argv[1] == "1"
+stop_unused = sys.argv[2] == "1"
+role = sys.argv[3]
+
+MAX_CHILDREN = "100"
+IDLE = "5s"
+MAX_REQUESTS = "300"
+OPC_MIB = 256
+JIT_MIB = 32
+ACCEL_FILES = 100000
+SKIP_POOLS = {"www.conf", "global.conf"}
+
+def sh(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+print("clp-tune  role=%s  apply=%s" % (role, apply))
+print("  pm=ondemand  max_children=%s  idle=%s  max_requests=%s" % (MAX_CHILDREN, IDLE, MAX_REQUESTS))
+print("  opcache.memory_consumption=%s  jit_buffer=%sM  max_accelerated_files=%s" % (
+    OPC_MIB, JIT_MIB, ACCEL_FILES))
+print("  MySQL unchanged")
+if role == "standby":
+    print("  WARN: replica — run --apply on LIVE first, then Sync now here.")
+print()
+
+changes = []
+
+def set_key(text, key, value):
+    pat = re.compile(r"^(%s\s*=\s*).+$" % re.escape(key), re.M)
+    if pat.search(text):
+        return pat.sub(r"\g<1>%s" % value, text, count=1)
+    pm = re.search(r"^(pm\s*=\s*.+)$", text, re.M)
+    line = "%s = %s\n" % (key, value)
+    if pm:
+        return text[: pm.end()] + "\n" + line + text[pm.end() :]
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + line
+
+def patch_pool(old):
+    notes = []
+    new = old
+    pairs = [
+        ("pm", "ondemand"),
+        ("pm.max_children", MAX_CHILDREN),
+        ("pm.process_idle_timeout", IDLE),
+        ("pm.max_requests", MAX_REQUESTS),
+    ]
+    for key, val in pairs:
+        m = re.search(r"^%s\s*=\s*(.+)$" % re.escape(key), new, re.M)
+        was = m.group(1).strip() if m else None
+        updated = set_key(new, key, val)
+        if updated != new:
+            notes.append("%s %s -> %s" % (key, was if was is not None else "(add)", val))
+            new = updated
+    return new, notes
+
+site_versions = set()
+all_versions = set()
+for path in sorted(glob.glob("/etc/php/*/fpm/pool.d/*.conf")):
+    base = os.path.basename(path)
+    ver = path.split("/etc/php/")[-1].split("/")[0]
+    all_versions.add(ver)
+    if base in SKIP_POOLS:
+        continue
+    if base != "default.conf":
+        site_versions.add(ver)
+    old = open(path, errors="replace").read()
+    if not re.search(r"^pm\.max_children\s*=", old, re.M):
+        continue
+    new, notes = patch_pool(old)
+    if new != old:
+        changes.append(("pool", path, "; ".join(notes), new))
+
+def set_ini(text, key, want):
+    pat = re.compile(r"^(%s\s*=\s*).+$" % re.escape(key), re.M)
+    m = re.search(r"^%s\s*=\s*(.+)$" % re.escape(key), text, re.M)
+    if m:
+        was = m.group(1).strip()
+        if was == str(want):
+            return text, None
+        return pat.sub(r"\g<1>%s" % want, text, count=1), "%s %s -> %s" % (key, was, want)
+    mem = re.search(r"^(opcache\.memory_consumption\s*=\s*.+)$", text, re.M)
+    line = "%s=%s" % (key, want)
+    if mem:
+        return text[: mem.end()] + "\n" + line + text[mem.end() :], "%s (add) -> %s" % (key, want)
+    if not text.endswith("\n"):
+        text += "\n"
+    return text + line + "\n", "%s (add) -> %s" % (key, want)
+
+ini_targets = [
+    ("opcache.memory_consumption", str(OPC_MIB)),
+    ("opcache.jit_buffer_size", "%sM" % JIT_MIB),
+    ("opcache.max_accelerated_files", str(ACCEL_FILES)),
+]
+for path in sorted(glob.glob("/etc/php/*/fpm/php.ini")):
+    ver = path.split("/etc/php/")[-1].split("/")[0]
+    if ver not in site_versions:
+        continue
+    old = open(path, errors="replace").read()
+    new = old
+    notes = []
+    for key, val in ini_targets:
+        updated, note = set_ini(new, key, val)
+        if note:
+            notes.append(note)
+            new = updated
+    if new != old:
+        changes.append(("php.ini", path, "; ".join(notes), new))
+
+def set_php_value(block, key, want_num, suffix=None, only_if_higher=False):
+    notes = []
+    pat = re.compile(r"(%s=)(\d+)(M?)" % re.escape(key))
+    m = pat.search(block)
+    if not m:
+        return block, notes
+    was = int(m.group(2))
+    if only_if_higher and was <= want_num:
+        return block, notes
+    if was == want_num and (suffix is None or m.group(3) == suffix or (not suffix and not m.group(3))):
+        return block, notes
+    end = suffix if suffix is not None else m.group(3)
+    block = pat.sub(r"\g<1>%s%s" % (want_num, end), block, count=1)
+    notes.append("%s %s%s -> %s%s" % (key, was, m.group(3), want_num, end))
+    return block, notes
+
+def patch_php_value(block):
+    notes = []
+    block, n = set_php_value(block, "opcache.memory_consumption", OPC_MIB)
+    notes.extend(n)
+    block, n = set_php_value(block, "opcache.jit_buffer_size", JIT_MIB, "M", only_if_higher=True)
+    notes.extend(n)
+    block, n = set_php_value(block, "opcache.max_accelerated_files", ACCEL_FILES)
+    notes.extend(n)
+    if "opcache.max_accelerated_files=" not in block:
+        block = block.rstrip() + "\nopcache.max_accelerated_files=%s;\n" % ACCEL_FILES
+        notes.append("opcache.max_accelerated_files (add) -> %s" % ACCEL_FILES)
+    return block, notes
+
+vhost_re = re.compile(r"(fastcgi_param PHP_VALUE \")(.*?)(\";)", re.S)
+for path in sorted(glob.glob("/etc/nginx/sites-enabled/*.conf")):
+    old = open(path, errors="replace").read()
+    notes = []
+    def repl(m):
+        body, n = patch_php_value(m.group(2))
+        notes.extend(n)
+        return m.group(1) + body + m.group(3)
+    new = vhost_re.sub(repl, old)
+    if new != old and notes:
+        uniq = []
+        for x in notes:
+            if x not in uniq:
+                uniq.append(x)
+        changes.append(("vhost", path, "; ".join(uniq), new))
+
+unused = sorted(all_versions - site_versions)
+print("  PHP versions with site pools: %s" % (",".join(sorted(site_versions)) or "none"))
+print("  PHP versions with no sites (stop php*-fpm): %s" % (",".join(unused) or "none"))
+print("  clp-php-fpm: leave running (CloudPanel panel)")
+print()
+
+if not changes and not (apply and stop_unused and unused):
+    if not changes:
+        print("  pool/ini/vhost already match")
+    if not apply:
+        print()
+        print("Dry-run only. On LIVE:")
+        print("  sudo /opt/clp-sync/bin/clp-tune --apply")
+    sys.exit(0)
+
+for kind, path, note, _ in changes:
+    print("  %s  %s" % (kind, path))
+    print("    %s" % note)
+
+if not apply:
+    print()
+    print("Dry-run only. On LIVE:")
+    print("  sudo /opt/clp-sync/bin/clp-tune --apply")
+    sys.exit(0)
+
+backup = "/var/lib/clp-sync/tune-backup-%s" % time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+os.makedirs(backup, exist_ok=True)
+for kind, path, note, new in changes:
+    rel = path.lstrip("/")
+    dest = os.path.join(backup, rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(path, dest)
+    open(path, "w").write(new)
+if changes:
+    print()
+    print("  wrote files; backup %s" % backup)
+    t = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    if t.returncode != 0:
+        print(t.stderr or t.stdout)
+        print("nginx -t failed — restoring backups")
+        for kind, path, note, new in changes:
+            rel = path.lstrip("/")
+            shutil.copy2(os.path.join(backup, rel), path)
+        sys.exit(1)
+    subprocess.run(["systemctl", "reload", "nginx"], check=False)
+    units = sh("systemctl list-units --type=service --state=running --no-legend --plain").splitlines()
+    for line in units:
+        name = line.split()[0] if line.split() else ""
+        if re.match(r"php[0-9]+\.[0-9]+-fpm\.service$", name) or name == "clp-php-fpm.service":
+            subprocess.run(["systemctl", "reload", name], check=False)
+    print("  reloaded nginx + active php-fpm")
+
+if stop_unused:
+    for ver in unused:
+        unit = "php%s-fpm" % ver
+        if subprocess.run(["systemctl", "cat", unit], capture_output=True).returncode != 0:
+            continue
+        ac = sh("systemctl is-active %s" % unit)
+        en = sh("systemctl is-enabled %s" % unit)
+        if ac == "active" or en in ("enabled", "enabled-runtime"):
+            subprocess.run(["systemctl", "disable", "--now", unit], check=False)
+            print("  stopped unused %s (no site pools)" % unit)
+
+print("  replica: run Sync now after LIVE apply so it matches")
+PY

@@ -80,6 +80,9 @@ systemctl disable clp-sync.service 2>/dev/null || true
 
 echo "==> Removing systemd units..."
 rm -f /etc/systemd/system/clp-sync.service /etc/systemd/system/clp-sync.timer
+rm -rf /etc/systemd/system/clp-sync.timer.d
+rm -f /etc/sudoers.d/clp-sync-ui
+rm -f /home/clp/htdocs/app/files/public/clp-sync.php
 systemctl daemon-reload
 
 echo "==> Removing install and state..."

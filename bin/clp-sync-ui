@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Privileged helper for the replica badge (frequency + promote). Called via sudo from clp-sync.php.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+# shellcheck source=../lib/inventory.sh
+source "${ROOT}/lib/inventory.sh"
+# shellcheck source=../lib/pull.sh
+source "${ROOT}/lib/pull.sh"
+
+TOKEN_FILE=/etc/clp-sync/ui.token
+
+usage() {
+  echo "Usage: clp-sync-ui <token> frequency <1h|2h|4h|6h|12h|24h|off>" >&2
+  echo "       clp-sync-ui <token> now" >&2
+  echo "       clp-sync-ui <token> live LIVE" >&2
+  exit 1
+}
+
+verify_token() {
+  local got="${1:-}" want
+  want="$(tr -d '[:space:]' <"${TOKEN_FILE}" 2>/dev/null || true)"
+  [[ "${got}" =~ ^[a-f0-9]{32}$ ]] || die "bad token"
+  [[ -n "${want}" ]] || die "ui token missing"
+  [[ "${got}" == "${want}" ]] || die "bad token"
+}
+
+require_root
+[[ $# -ge 2 ]] || usage
+
+TOKEN="$1"
+ACTION="$2"
+shift 2
+verify_token "${TOKEN}"
+load_config
+
+case "${ACTION}" in
+  frequency)
+    set_sync_interval "${1:-}"
+    # shellcheck disable=SC1090
+    source /etc/clp-sync/config.env
+    : "${SYNC_INTERVAL:=1h}"
+    ensure_replicated_badge
+    ;;
+  now|sync)
+    [[ "${ROLE:-}" == "standby" ]] || die "Sync now only runs on the replica"
+    if systemctl is-active --quiet clp-sync.service || systemctl is-active --quiet clp-sync-now.service; then
+      die "A sync is already running"
+    fi
+    systemd-run --quiet --no-block --collect --unit=clp-sync-now \
+      /opt/clp-sync/bin/clp-sync --manual
+    echo "OK sync started"
+    ;;
+  live)
+    [[ "${1:-}" == "LIVE" ]] || die "Type LIVE to confirm"
+    [[ "${ROLE:-}" == "standby" ]] || die "Already live or not a replica"
+    switch_live_with_peer
+    ;;
+  *)
+    usage
+    ;;
+esac

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # clp-sync — standby pull mirror from the live master.
+# Copies live PHP-FPM/nginx as-is. Never runs clp-tune (manual only).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +15,8 @@ SKIP_FILES=0
 SKIP_MYSQL=0
 SKIP_NGINX=0
 DRY_CONNECT_ONLY=0
+MANUAL=0
+RESOURCES=0
 
 usage() {
   cat <<'EOF'
@@ -26,6 +29,8 @@ Options:
   --skip-mysql     Skip MySQL dump/import
   --skip-nginx     Skip nginx/PHP pull
   --connect-only   Probe master SSH, then exit
+  --resources      Read-only RAM / PHP-FPM / MySQL snapshot (live or replica)
+  --manual         Run even if the timer is off (Sync now)
   -h, --help
 EOF
 }
@@ -36,6 +41,8 @@ while [[ $# -gt 0 ]]; do
     --skip-mysql) SKIP_MYSQL=1 ;;
     --skip-nginx) SKIP_NGINX=1 ;;
     --connect-only) DRY_CONNECT_ONLY=1 ;;
+    --resources) RESOURCES=1 ;;
+    --manual) MANUAL=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
@@ -45,9 +52,14 @@ done
 require_root
 load_config
 
-[[ "${ROLE}" == "standby" ]] || die "clp-sync now runs on the standby (ROLE=standby). Master only allows a restricted SSH key."
+if [[ "${RESOURCES}" -eq 1 ]]; then
+  report_resources
+  exit 0
+fi
 
-if [[ -n "${INVOCATION_ID:-}" && "${SYNC_AUTO:-0}" != "1" ]]; then
+[[ "${ROLE}" == "standby" ]] || die "clp-sync now runs on the standby (ROLE=standby). Master only allows a restricted SSH key. Use --resources on either role."
+
+if [[ "${MANUAL}" -eq 0 && -n "${INVOCATION_ID:-}" && "${SYNC_AUTO:-0}" != "1" ]]; then
   echo "clp-sync: automatic sync is off (SYNC_AUTO=0)"
   echo "Enable with: /opt/clp-sync/bin/clp-sync-control on"
   exit 0
@@ -67,9 +79,9 @@ if ! flock -n 9; then
 fi
 
 START_TS="$(date +%s)"
-trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
+trap 'rc=$?; mysql_import_speedup_end 2>/dev/null || true; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
 
-require_cmds ssh rsync sqlite3 flock timeout mysql mysqldump php
+require_cmds ssh rsync sqlite3 flock timeout mysql mysqldump
 log_info "clp-sync pull ← ${MASTER_HOST}"
 
 pull_probe || die "Cannot reach master (install pull key with clp-allow-pull)"
@@ -86,6 +98,7 @@ DB_SNAP="${CLP_SYNC_TMP_DIR}/db.sq3"
 log_info "Inventory snapshot: ${DB_SNAP}"
 
 ensure_linux_users "${DB_SNAP}"
+apply_user_identities
 pull_app_secret
 
 if [[ "${SKIP_FILES}" -eq 0 ]]; then
@@ -93,8 +106,9 @@ if [[ "${SKIP_FILES}" -eq 0 ]]; then
 fi
 
 if [[ "${SKIP_NGINX}" -eq 0 ]]; then
-  pull_nginx_php
+  pull_nginx_php "${DB_SNAP}"
 fi
+pull_system_extras
 
 if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
   pull_and_import_mysql "${DB_SNAP}"
@@ -102,7 +116,9 @@ fi
 
 apply_panel_db_local "${DB_SNAP}"
 disable_local_backup_jobs
-ensure_php_services
+apply_master_service_state "${DB_SNAP}"
+ensure_replicated_badge
+verify_standby_ready
 
 DURATION="$(( $(date +%s) - START_TS ))"
 write_status ok "duration_s=${DURATION}"

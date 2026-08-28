@@ -103,7 +103,7 @@ Pause or resume replication without uninstalling:
 
 | Metric | Typical |
 |--------|---------|
-| **RPO** (max data loss) | Up to 15 minutes (last sync interval) |
+| **RPO** (max data loss) | Up to the replica timer interval (default 1h) |
 | **RTO** (time to switch) | DNS TTL + `clp-promote` (~5–30 min) |
 
 ---

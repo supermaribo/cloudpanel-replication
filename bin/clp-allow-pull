@@ -20,8 +20,9 @@ Usage:
   clp-allow-pull /path/to/id.pub
   clp-allow-pull -          # read pubkey from stdin
 
-Adds a restricted authorized_keys entry. The standby can only rsync-read,
-mysqldump to stdout, and snapshot the panel sqlite. No writes on this host.
+Adds a restricted authorized_keys entry. The peer can only rsync-read,
+mysqldump to stdout, snapshot the panel sqlite, read services, and
+run become-standby / resume-pull (role swap).
 EOF
 }
 

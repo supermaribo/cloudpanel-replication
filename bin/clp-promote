@@ -8,6 +8,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/lib/common.sh"
 # shellcheck source=../lib/promote.sh
 source "${ROOT}/lib/promote.sh"
+# shellcheck source=../lib/pull.sh
+source "${ROOT}/lib/pull.sh"
 
 FORCE=0
 MAX_AGE=60
@@ -16,9 +18,9 @@ usage() {
   cat <<'EOF'
 Usage: clp-promote [options]
 
-Promote this STANDBY server to MASTER after the primary is lost.
-Blocks inbound sync from the old master and disables outbound sync
-until you configure a new standby (clp-set-standby).
+Promote this STANDBY server to LIVE after the primary is lost.
+Does not switch the other box (orphan). Panel Make live swaps both
+when the peer is reachable.
 
 Options:
   -y, --yes           Skip confirmation (still runs readiness checks)
@@ -28,7 +30,7 @@ Options:
 
 After promotion:
   1. Point DNS at this server
-  2. Run clp-set-standby when you have a new mirror target
+  2. Pair the other box as replica: clp-pair-peer / clp-allow-pull
 EOF
 }
 

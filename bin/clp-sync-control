@@ -10,13 +10,14 @@ source "${ROOT}/lib/promote.sh"
 
 usage() {
   cat <<'EOF'
-Usage: clp-sync-control <on|off|status>
+Usage: clp-sync-control <on|off|status|interval>
 
-Toggle the 15-minute pull timer on the standby.
+Toggle the pull timer on the standby.
 
-  on      Enable the timer
-  off     Disable (manual clp-sync still works)
-  status  Show current setting
+  on                    Enable the timer
+  off                   Disable (manual clp-sync still works)
+  status                Show current setting
+  interval 1h|2h|4h|6h|12h|24h|off
 EOF
 }
 
@@ -34,6 +35,10 @@ case "${ACTION}" in
   off|disable)
     toggle_sync off
     ;;
+  interval|frequency)
+    [[ "${ROLE:-standby}" == "standby" ]] || die "Timer runs on the standby (puller)"
+    set_sync_interval "${2:-}"
+    ;;
   status)
     cfg="${CLP_SYNC_CONFIG:-/etc/clp-sync/config.env}"
     if [[ -f "${cfg}" ]]; then
@@ -42,6 +47,8 @@ case "${ACTION}" in
       echo "ROLE=${ROLE:-unknown}"
       echo "SYNC_ENABLED=${SYNC_ENABLED:-1}"
       echo "SYNC_AUTO=${SYNC_AUTO:-0}"
+      echo "SYNC_INTERVAL=${SYNC_INTERVAL:-1h}"
+      echo "PEER_HOST=${PEER_HOST:-}"
       echo "MASTER_HOST=${MASTER_HOST:-}"
       echo "PROMOTED=${PROMOTED:-0}"
       [[ "${PROMOTED:-0}" == "1" ]] && grep ^PROMOTED_AT= "${cfg}" || true

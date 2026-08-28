@@ -28,11 +28,11 @@ On the **standby**:
 
 ```bash
 sudo /opt/clp-sync/bin/clp-sync --connect-only
-sudo /opt/clp-sync/bin/clp-sync
+sudo /opt/clp-sync/bin/clp-sync --manual
 # later: sudo /opt/clp-sync/bin/clp-sync-control on
 ```
 
-**Uninstall master** (does not touch CloudPanel or sites):
+**Uninstall** (does not touch CloudPanel or sites):
 
 ```bash
 sudo /opt/clp-sync/bin/uninstall.sh -y
@@ -47,8 +47,17 @@ sudo bash /tmp/clp-install.sh
 
 | Server | Role |
 |--------|------|
-| Master (live) | Restricted SSH key only — `clp-allow-pull` |
-| Standby (mirror) | Pulls files + clones site MySQL as root (`mysqldump` over SSH) |
+| Master (live) | Restricted SSH key only — `clp-allow-pull`. No timer. |
+| Standby (replica) | Pulls files + site MySQL; timer + CloudPanel **Sync now** |
+
+Update an existing install from the replica (does not replace `/etc/clp-sync/config.env`):
+
+```bash
+# On live, pull toolkit from the replica
+sudo rsync -a --exclude config.env --exclude '.git/' \
+  root@<replica-tailscale>:/opt/clp-sync/ /opt/clp-sync/
+sudo chmod 755 /opt/clp-sync/bin/*
+```
 
 Alternative (git clone):
 
@@ -57,7 +66,7 @@ git clone https://github.com/supermaribo/cloudpanel-replication.git /root/clp-sy
 cd /root/clp-sync-src && sudo CLP_SYNC_ROLE=standby ./install-full.sh
 ```
 
-**Prerequisites:** Ubuntu, CloudPanel on both servers, Tailscale on same tailnet.
+**Prerequisites:** Debian 12 or Ubuntu, CloudPanel on both servers, Tailscale on the same tailnet.
 
 → [Quick start](docs/quickstart.md) · [Full install guide](docs/installation.md)
 
@@ -67,14 +76,14 @@ cd /root/clp-sync-src && sudo CLP_SYNC_ROLE=standby ./install-full.sh
 
 | Guide | Description |
 |-------|-------------|
-| [Quick start](docs/quickstart.md) | Copy-paste install (5 min) |
+| [Quick start](docs/quickstart.md) | Copy-paste install |
 | [Installation](docs/installation.md) | Complete step-by-step |
 | [Command reference](docs/commands.md) | Every script and flag |
 | [Architecture](docs/architecture.md) | How sync works |
 | [Master read-only policy](docs/master-readonly.md) | **No CloudPanel changes on master** |
 | [Compatibility checks](docs/compatibility-checks.md) | Preflight validation |
-| [Operations](docs/operations.md) | Logs, timer, daily use |
-| [Failover](docs/failover.md) | `clp-promote` when master is lost |
+| [Operations](docs/operations.md) | Logs, timer, PHP-FPM tune, daily use |
+| [Failover](docs/failover.md) | Make live / `clp-promote` when master is lost |
 | [Uninstall](docs/uninstall.md) | Remove sync tooling |
 | [Troubleshooting](docs/troubleshooting.md) | Common fixes |
 | [Docs index](docs/README.md) | All guides |
@@ -85,38 +94,45 @@ cd /root/clp-sync-src && sudo CLP_SYNC_ROLE=standby ./install-full.sh
 
 | Layer | Method |
 |-------|--------|
-| Site files (`/home/<user>/`) | rsync (`.ssh`, SSL, app data) |
+| Site files (`/home/<user>/`) | rsync (logs/`tmp` skipped; Laravel `bootstrap/cache` kept) |
 | Linux / FTP / `clp` users | Password hashes, shells, groups |
 | SSL / Let's Encrypt | nginx + ACME paths |
-| Nginx + PHP-FPM pools | Config sync + reload |
-| MySQL databases | Dump/import; skip unchanged |
-| Cron jobs | `/etc/cron.d/<siteUser>` |
-| CloudPanel panel DB | Live `db.sq3` on standby |
+| Nginx + PHP-FPM pools | Config sync + reload (only PHP versions sites use) |
+| MySQL databases | Dump over Tailscale as the site user; import on replica; skip unchanged |
+| Cron jobs | `/etc/cron.d` + site user crontabs |
+| CloudPanel panel DB | Live `db.sq3` snapshot on standby |
 
 **Not mirrored:** SSH host keys, Tailscale identity, public IP/hostname.
 
-**RPO:** ~15 min · **Failover:** `clp-promote` + DNS
+**RPO:** replica timer (default **1h**; CloudPanel UI 1h–24h or off) · **Failover:** Make live / `clp-promote` + DNS
 
 ---
 
 ## Common commands
 
+Run **on the replica** unless noted:
+
 ```bash
-# Verify (master)
-/opt/clp-sync/bin/clp-check all
-/opt/clp-sync/bin/clp-failover-check 30
+# Probe master SSH
+sudo /opt/clp-sync/bin/clp-sync --connect-only
 
-# Manual sync (master)
-/opt/clp-sync/bin/clp-sync
+# Sync now (same as the CloudPanel “Sync now” button)
+sudo /opt/clp-sync/bin/clp-sync --manual
 
-# Master lost — run on STANDBY
-/opt/clp-sync/bin/clp-promote
+# RAM / PHP-FPM snapshot (safe on live or replica; no writes)
+sudo /opt/clp-sync/bin/clp-sync --resources
 
-# Pause sync (master)
-/opt/clp-sync/bin/clp-sync-control off
+# Timer
+sudo /opt/clp-sync/bin/clp-sync-control status
+sudo /opt/clp-sync/bin/clp-sync-control on
+sudo /opt/clp-sync/bin/clp-sync-control interval 12h
 
-# Uninstall
-sudo /opt/clp-sync/bin/uninstall.sh
+# PHP-FPM / OPcache caps — manual only, never part of sync. Apply on LIVE.
+sudo /opt/clp-sync/bin/clp-tune
+sudo /opt/clp-sync/bin/clp-tune --apply
+
+# Make this replica live (after DNS)
+sudo /opt/clp-sync/bin/clp-promote
 ```
 
 Full reference: [docs/commands.md](docs/commands.md)
@@ -130,14 +146,14 @@ install-full.sh          One-liner entry point (clone + install.sh)
 bin/
   install.sh             Interactive installer (both roles)
   uninstall.sh           Remove sync agent
-  clp-sync               Sync orchestrator (master, every 15 min)
-  clp-bootstrap          First full clone
-  clp-check              Compatibility checks
-  clp-promote            Standby → master failover
-  clp-set-standby        New standby after promotion
-  clp-sync-control       Pause/resume sync
-  clp-failover-check     Pre-cutover check
-  clp-pair-listen        Standby pairing listener
+  clp-sync               Replica pull (timer + Sync now)
+  clp-tune               Manual PHP-FPM / OPcache caps (live)
+  clp-sync-ui            CloudPanel badge helper (frequency / now / live)
+  clp-master-read-only   Forced SSH command on live
+  clp-allow-pull         Authorize the replica key on live
+  clp-promote            Replica → live
+  clp-sync-control       Pause/resume / interval
+  clp-role / clp-pair-peer
 docs/                    Full documentation
 ```
 

@@ -12,7 +12,7 @@ allow_path() {
   [[ "${p}" == /* ]] || return 1
   [[ "${p}" != *..* ]] || return 1
   case "${p}" in
-    /home/*|/etc/nginx|/etc/nginx/*|/etc/php|/etc/php/*|/etc/letsencrypt|/etc/letsencrypt/*|/var/lib/letsencrypt|/var/lib/letsencrypt/*|/etc/cron.d|/etc/cron.d/*)
+    /home/*|/etc/nginx|/etc/nginx/*|/etc/php|/etc/php/*|/etc/letsencrypt|/etc/letsencrypt/*|/var/lib/letsencrypt|/var/lib/letsencrypt/*|/etc/cron.d|/etc/cron.d/*|/etc/varnish|/etc/varnish/*)
       return 0
       ;;
     *)
@@ -26,6 +26,12 @@ probe() {
   hostname -f 2>/dev/null || hostname
   uname -m
   df -Pk /home 2>/dev/null | awk 'NR==2 {print $4}'
+  local pdb="/home/clp/htdocs/app/data/db.sq3"
+  if [[ -f "${pdb}" ]]; then
+    printf 'panel\t%s\t%s\n' "$(stat -c '%Y' "${pdb}")" "$(stat -c '%s' "${pdb}")"
+  fi
+  # Trailing svc lines: unit, is-enabled, is-active. Old clients ignore these.
+  report_services | awk -F '\t' 'NR>1 && NF==3 { print "svc\t" $1 "\t" $2 "\t" $3 }'
 }
 
 panel_backup() {
@@ -38,7 +44,120 @@ panel_backup() {
   rm -f "${tmp}"
 }
 
-# Root socket dump of site databases (stdout only). Never dumps mysql/sys.
+# Intentional systemd state only (is-enabled). Never reports mysql/nginx/ssh.
+report_services() {
+  echo "clp-sync-services 1"
+  _svc_line() {
+    local u="$1" en ac
+    [[ "${u}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || return 0
+    systemctl cat "${u}.service" >/dev/null 2>&1 || return 0
+    en="$(systemctl is-enabled "${u}" 2>/dev/null | head -1)" || true
+    ac="$(systemctl is-active "${u}" 2>/dev/null | head -1)" || true
+    [[ -n "${en}" ]] || en=unknown
+    [[ -n "${ac}" ]] || ac=unknown
+    printf '%s\t%s\t%s\n' "${u}" "${en}" "${ac}"
+  }
+  local u
+  for u in varnish varnishncsa redis-server proftpd memcached rabbitmq-server; do
+    _svc_line "${u}"
+  done
+  while IFS= read -r u; do
+    [[ -n "${u}" ]] || continue
+    _svc_line "${u}"
+  done < <(systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null \
+    | awk '$1 ~ /^php[0-9]+\.[0-9]+-fpm\.service$/ { sub(/\.service$/, "", $1); print $1 }')
+}
+
+# Site/FTP/clp password hashes only (from this host's panel sqlite). Never root.
+export_passwd() {
+  echo "clp-sync-passwd 1"
+  python3 - <<'PY'
+import os, sqlite3, subprocess
+
+DENY = {
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news",
+    "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats", "nobody",
+    "systemd-network", "systemd-resolve", "messagebus", "sshd", "mysql", "redis",
+    "debian-spamd", "uuidd", "tcpdump", "landscape", "pollinate", "ec2-user",
+    "ubuntu", "admin", "debian",
+}
+db = "/home/clp/htdocs/app/data/db.sq3"
+users = {"clp"}
+if os.path.isfile(db):
+    con = sqlite3.connect(db)
+    try:
+        for (u,) in con.execute("SELECT DISTINCT user FROM site WHERE user IS NOT NULL AND user != ''"):
+            users.add(str(u).strip())
+    except sqlite3.Error:
+        pass
+    try:
+        for (u,) in con.execute("SELECT DISTINCT user_name FROM ftp_user WHERE user_name IS NOT NULL AND user_name != ''"):
+            users.add(str(u).strip())
+    except sqlite3.Error:
+        pass
+
+def getent(kind, name):
+    p = subprocess.run(["getent", kind, name], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+for name in sorted(users):
+    if not name or name in DENY or name.startswith("systemd-"):
+        continue
+    if not all(c.isalnum() or c in "._-" for c in name) or not name[0].isalpha():
+        continue
+    pw = getent("passwd", name)
+    sh = getent("shadow", name)
+    if not pw:
+        continue
+    parts = pw.split(":")
+    if len(parts) < 7:
+        continue
+    _, _, uid, gid, _, home, shell = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+    print(f"P\t{name}\t{uid}\t{gid}\t{home}\t{shell}")
+    hashv = sh.split(":")[1] if sh and ":" in sh else ""
+    if hashv and hashv not in ("!", "*", ""):
+        print(f"S\t{name}\t{hashv}")
+    try:
+        g = subprocess.check_output(["id", "-Gn", name], text=True).strip().replace(" ", ",")
+    except Exception:
+        g = name
+    print(f"G\t{name}\t{g}")
+PY
+}
+
+# Site-user crontabs only (not root). Body is base64 so it stays one line.
+export_crontabs() {
+  echo "clp-sync-crontabs 1"
+  python3 - <<'PY'
+import base64, os, sqlite3, subprocess
+
+DENY = {
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news",
+    "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats", "nobody",
+    "mysql", "redis", "sshd", "ubuntu", "admin", "debian",
+}
+db = "/home/clp/htdocs/app/data/db.sq3"
+users = set()
+if os.path.isfile(db):
+    con = sqlite3.connect(db)
+    try:
+        for (u,) in con.execute("SELECT DISTINCT user FROM site WHERE user IS NOT NULL AND user != ''"):
+            users.add(str(u).strip())
+    except sqlite3.Error:
+        pass
+
+for name in sorted(users):
+    if not name or name in DENY or name.startswith("systemd-"):
+        continue
+    if not all(c.isalnum() or c in "._-" for c in name) or not name[0].isalpha():
+        continue
+    p = subprocess.run(["crontab", "-u", name, "-l"], capture_output=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        continue
+    print("C\t%s\t%s" % (name, base64.b64encode(p.stdout).decode("ascii")))
+PY
+}
+
 dump_dbs() {
   local -a names=()
   local db
@@ -82,6 +201,14 @@ fi
 case "${cmd}" in
   clp-sync-probe) probe; exit 0 ;;
   clp-panel-backup) panel_backup; exit 0 ;;
+  clp-sync-services) report_services; exit 0 ;;
+  clp-sync-passwd) export_passwd; exit 0 ;;
+  clp-sync-crontabs) export_crontabs; exit 0 ;;
+  clp-sync-become-standby) exec /opt/clp-sync/bin/clp-role become-standby ;;
+  clp-sync-resume-pull) exec /opt/clp-sync/bin/clp-role resume-pull ;;
+  clp-sync-pair-peer\ *)
+    exec /opt/clp-sync/bin/clp-role pair-peer "${cmd#clp-sync-pair-peer }"
+    ;;
   clp-mysqldump\ *)
     # shellcheck disable=SC2086
     dump_dbs ${cmd#clp-mysqldump }

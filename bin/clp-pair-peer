@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# One-time bidirectional pairing: pull key + PEER_HOST on this box.
+# Run on BOTH hosts, then clp-allow-pull the printed key on the peer.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT}/lib/common.sh"
+# shellcheck source=../lib/install-common.sh
+source "${ROOT}/lib/install-common.sh"
+# shellcheck source=../lib/promote.sh
+source "${ROOT}/lib/promote.sh"
+# shellcheck source=../lib/inventory.sh
+source "${ROOT}/lib/inventory.sh"
+# shellcheck source=../lib/pull.sh
+source "${ROOT}/lib/pull.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: clp-pair-peer <peer-tailscale-name-or-ip>
+
+Generates /root/.ssh/clp_sync_ed25519 if missing, records PEER_HOST, installs
+the pull timer unit (left disabled until this box is a replica).
+
+Then authorize THIS public key on the other host:
+  sudo /opt/clp-sync/bin/clp-allow-pull 'ssh-ed25519 AAAA…'
+EOF
+}
+
+require_root
+[[ "${1:-}" != "-h" && "${1:-}" != "--help" ]] || { usage; exit 0; }
+
+load_config 2>/dev/null || true
+
+peer="${1:-${PEER_HOST:-${MASTER_HOST:-${STANDBY_HOST:-}}}}"
+[[ -n "${peer}" ]] || { usage; exit 1; }
+
+ensure_pull_key /root/.ssh/clp_sync_ed25519
+config_set_kv "PEER_HOST" "${peer}"
+config_set_kv "MASTER_SSH_KEY" "/root/.ssh/clp_sync_ed25519"
+if [[ "${ROLE:-standby}" == "standby" ]]; then
+  config_set_kv "MASTER_HOST" "${peer}"
+  config_set_kv "PRIMARY_HOST" "${peer}"
+else
+  config_set_kv "STANDBY_HOST" "${peer}"
+fi
+
+install_sync_units
+if [[ "${ROLE:-}" == "master" ]]; then
+  systemctl disable --now clp-sync.timer 2>/dev/null || true
+  ensure_live_badge || true
+fi
+
+self="$(tailscale_self_name 2>/dev/null || hostname -f 2>/dev/null || hostname)"
+pub="$(cat /root/.ssh/clp_sync_ed25519.pub)"
+
+echo "OK PEER_HOST=${peer}"
+echo
+echo "This host public key:"
+echo "  ${pub}"
+echo
+echo "On ${peer} run:"
+echo "  sudo /opt/clp-sync/bin/clp-allow-pull '${pub}'"
+echo "  sudo /opt/clp-sync/bin/clp-pair-peer ${self}"

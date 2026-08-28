@@ -2,16 +2,51 @@
 # SSH keys (.ssh/) ARE synced so site-user login mirrors the primary.
 # Server SSH host keys are never synced (machines stay distinct on the network).
 
+# Web / PHP / nginx / app logs (and rotated copies).
+# Do not use **/log/ — that would skip vendor/psr/log.
+# NEVER exclude htdocs/bootstrap/cache — missing it 500s the whole site.
+/logs/
 logs/
-tmp/
-**/cache/
-**/wp-content/cache/
-**/wp-content/uploads/cache/
-**/storage/framework/cache/
-**/storage/framework/sessions/
 **/storage/logs/
-**/node_modules/.cache/
+**/var/log/
+**/var/logs/
 *.log
+*.log.*
+*.log-[0-9]*
+*.log.[0-9]*
+**/*.log
+**/*.log.*
+**/*.log.gz
+**/*.log.xz
+**/*.log.bz2
+**/*.log.zip
+access.log*
+error.log*
+access_log
+error_log
+**/access.log*
+**/error.log*
+**/access_log
+**/error_log
+**/debug.log
+**/.debug.log
+**/php_errors.log
+**/php-fpm*.log*
+**/slow.log*
+**/nginx/*.log*
+**/mail.log
+
+# Disposable temp only (not Laravel bootstrap/cache or wp-content/cache).
+tmp/
+**/tmp/
+**/temp/
+*.tmp
+
+# Local dumps / junk
 backups/
 backups/*.sql.gz
+core
+core.*
 .DS_Store
+*.swp
+*.swo

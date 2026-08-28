@@ -156,6 +156,16 @@ install_files() {
   c_ok "Files installed"
 }
 
+ensure_pull_key() {
+  local key="${1:-/root/.ssh/clp_sync_ed25519}"
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  if [[ ! -f "${key}" ]]; then
+    ssh-keygen -t ed25519 -f "${key}" -N '' -C "clp-sync-peer"
+  fi
+  chmod 600 "${key}" "${key}.pub" 2>/dev/null || true
+}
+
 write_config() {
   local role="$1"
   local peer_host="${2:-}"
@@ -174,10 +184,12 @@ ROLE=${role}
 PROMOTED=0
 SYNC_ENABLED=$([[ "${role}" == "standby" ]] && echo 1 || echo 0)
 SYNC_AUTO=0
+SYNC_INTERVAL=1h
 
 MASTER_HOST=${master_host}
 PRIMARY_HOST=${master_host}
 STANDBY_HOST=${standby_host}
+PEER_HOST=${peer_host}
 MASTER_SSH_USER=root
 MASTER_SSH_PORT=22
 MASTER_SSH_KEY=${ssh_key}
