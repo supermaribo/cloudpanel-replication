@@ -155,66 +155,71 @@ except sqlite3.Error as e:
 PY
 }
 
-# Clone site databases: root mysqldump on master (stdout) → load on this box.
-# Does not copy mysql.user (that would replace this server's own MySQL root).
+# Dump each site DB from master:3306 as the site user (already @%), then
+# load locally via PHP mysqli. Avoids CloudPanel mysql CLI eating stdin.
 pull_and_import_mysql() {
   local db_snap="$1"
-  local sql_file="${CLP_SYNC_TMP_DIR}/clone.sql"
-  local -a names=()
-  local site_id domain site_user db_name db_user n m sock password sql_pass
+  local site_id domain site_user db_name db_user dump_user password sql_file cnf n out
+  local importer="${CLP_SYNC_ROOT}/lib/import-sql.php"
+  [[ -f "${importer}" ]] || die "missing ${importer}"
 
   while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     [[ ",${MYSQL_SKIP_DATABASES}," == *",${db_name},"* ]] && continue
     [[ "${db_name}" =~ ^[A-Za-z0-9_]+$ ]] || continue
-    names+=("${db_name}")
-  done < <(inventory_databases "${db_snap}")
 
-  if ((${#names[@]} == 0)); then
-    log_info "No site databases to clone"
-    return 0
-  fi
-
-  pkill -f 'mysql.*--binary-mode' 2>/dev/null || true
-
-  log_info "Cloning MySQL as root: ${names[*]}"
-  rm -f "${sql_file}"
-  master_ssh "clp-mysqldump ${names[*]}" >"${sql_file}"
-  [[ -s "${sql_file}" ]] || die "empty MySQL dump from master"
-  sed -i '/sandbox mode/d;/^SET @@GLOBAL.GTID_PURGED/d' "${sql_file}" || true
-  n="$(wc -c <"${sql_file}")"
-  log_info "Loading clone locally (${n} bytes)"
-
-  m=/usr/bin/mysql
-  [[ -x "${m}" ]] || m="$(command -v mysql)"
-  sock=/run/mysqld/mysqld.sock
-  [[ -S "${sock}" ]] || sock=/var/run/mysqld/mysqld.sock
-  [[ -S "${sock}" ]] || die "local mysqld socket missing"
-
-  if ! timeout 600 "${m}" --no-defaults -u root --protocol=SOCKET --socket="${sock}" \
-    --skip-password --batch --force --binary-mode --max-allowed-packet=512M \
-    -e "SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION UNIQUE_CHECKS=0; source ${sql_file};"; then
-    die "MySQL clone import failed or timed out"
-  fi
-  rm -f "${sql_file}"
-  INC_MYSQL_IMPORT=${#names[@]}
-  log_ok "Imported ${#names[@]} database(s)"
-
-  while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
-    [[ -n "${db_name}" && -n "${db_user}" ]] || continue
-    [[ ",${MYSQL_SKIP_DATABASES}," == *",${db_name},"* ]] && continue
     password=""
-    if password="$(guess_db_password "${site_user}" "${domain}" "${db_name}")"; then
-      sql_pass="$(sql_escape "${password}")"
-      local_mysql -e "
-        CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
-        CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
-        ALTER USER '${db_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
-        ALTER USER '${db_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
-        GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
-        GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'127.0.0.1';
-        FLUSH PRIVILEGES;" 2>/dev/null || log_warn "Could not GRANT ${db_user}"
+    password="$(guess_db_password "${site_user}" "${domain}" "${db_name}")" || true
+    dump_user="$(guess_db_username "${site_user}" "${domain}" || true)"
+    [[ -n "${dump_user}" ]] || dump_user="${db_user}"
+    [[ -n "${password}" && -n "${dump_user}" ]] || die "no DB creds in .env for ${db_name}"
+
+    cnf="${CLP_SYNC_TMP_DIR}/dump-${db_name}.cnf"
+    sql_file="${CLP_SYNC_TMP_DIR}/${db_name}.sql"
+    MYSQL_DUMP_USER="${dump_user}" MYSQL_DUMP_PASS="${password}" \
+      MYSQL_DUMP_HOST="${MASTER_HOST}" MYSQL_DUMP_PORT="${MYSQL_DUMP_PORT}" \
+      MYSQL_DUMP_CNF="${cnf}" python3 - <<'PY'
+import os, pathlib
+p = pathlib.Path(os.environ["MYSQL_DUMP_CNF"])
+pw = os.environ["MYSQL_DUMP_PASS"].replace("\\", "\\\\").replace('"', '\\"')
+p.write_text(
+    "[client]\n"
+    f"user={os.environ['MYSQL_DUMP_USER']}\n"
+    f"password=\"{pw}\"\n"
+    f"host={os.environ['MYSQL_DUMP_HOST']}\n"
+    f"port={os.environ['MYSQL_DUMP_PORT']}\n"
+    "protocol=tcp\n"
+)
+p.chmod(0o600)
+PY
+
+    log_info "Dumping ${db_name} from ${MASTER_HOST}:${MYSQL_DUMP_PORT} as ${dump_user}"
+    rm -f "${sql_file}"
+    if ! mysqldump --defaults-file="${cnf}" --single-transaction --quick \
+      --routines --triggers --skip-dump-date --set-gtid-purged=OFF \
+      --default-character-set=utf8mb4 --no-tablespaces "${db_name}" >"${sql_file}"; then
+      rm -f "${cnf}" "${sql_file}"
+      die "mysqldump failed for ${db_name}"
     fi
+    rm -f "${cnf}"
+    [[ -s "${sql_file}" ]] || die "empty dump ${db_name}"
+    sed -i '/sandbox mode/d;/^SET @@GLOBAL.GTID_PURGED/d' "${sql_file}" || true
+    n="$(wc -c <"${sql_file}")"
+    log_info "Loading ${db_name} locally (${n} bytes)"
+    out="$(php "${importer}" "${db_name}" "${sql_file}")" || die "import failed for ${db_name}"
+    log_ok "${db_name}: ${out}"
+    rm -f "${sql_file}"
+    INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
+
+    sql_pass="$(sql_escape "${password}")"
+    local_mysql -e "
+      CREATE USER IF NOT EXISTS '${dump_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
+      CREATE USER IF NOT EXISTS '${dump_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
+      ALTER USER '${dump_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
+      ALTER USER '${dump_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
+      GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${dump_user}'@'localhost';
+      GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${dump_user}'@'127.0.0.1';
+      FLUSH PRIVILEGES;" 2>/dev/null || log_warn "Could not GRANT ${dump_user}"
   done < <(inventory_databases "${db_snap}")
   log_ok "MySQL clone complete"
 }

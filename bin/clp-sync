@@ -69,7 +69,7 @@ fi
 START_TS="$(date +%s)"
 trap 'rc=$?; if [[ $rc -ne 0 ]]; then notify_failure "exit=$rc"; write_status failed "exit=$rc"; fi' EXIT
 
-require_cmds ssh rsync sqlite3 flock timeout mysql
+require_cmds ssh rsync sqlite3 flock timeout mysql mysqldump php
 log_info "clp-sync pull ← ${MASTER_HOST}"
 
 pull_probe || die "Cannot reach master (install pull key with clp-allow-pull)"

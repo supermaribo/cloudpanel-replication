@@ -60,6 +60,7 @@ load_config() {
   : "${INCREMENTAL:=1}"
   : "${MYSQL_SKIP_UNCHANGED:=1}"
   : "${MYSQL_SKIP_DATABASES:=information_schema,performance_schema,sys,mysql}"
+  : "${MYSQL_DUMP_PORT:=3306}"
   : "${RELOAD_NGINX_ON_STANDBY:=1}"
   : "${APPLY_PANEL_DB:=1}"
   : "${SYNC_EXTRA_USERS:=clp}"

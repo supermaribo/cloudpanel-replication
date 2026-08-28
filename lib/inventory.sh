@@ -213,3 +213,25 @@ guess_db_password() {
   done
   return 1
 }
+
+guess_db_username() {
+  local site_user="$1" domain="$2"
+  local root="/home/${site_user}/htdocs/${domain}"
+  local f user
+  local search_root="/home/${site_user}/htdocs"
+  local env_files=()
+  [[ -d "${root}" ]] && env_files+=("${root}/.env" "${root}/.env.local" "${root}/app/.env")
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] && env_files+=("${f}")
+  done < <(find "${search_root}" -maxdepth 4 -name '.env' 2>/dev/null | head -20)
+  for f in "${env_files[@]}"; do
+    [[ -f "${f}" ]] || continue
+    user="$(grep -E '^DB_USERNAME=' "${f}" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'\''\r')" || true
+    [[ -z "${user}" ]] && user="$(grep -E '^DB_USER=' "${f}" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'\''\r')" || true
+    if [[ -n "${user}" ]]; then
+      printf '%s' "${user}"
+      return 0
+    fi
+  done
+  return 1
+}
