@@ -48,7 +48,7 @@ sudo bash /tmp/clp-install.sh
 | Server | Role |
 |--------|------|
 | Master (live) | Restricted SSH key only — `clp-allow-pull` |
-| Standby (mirror) | Pulls files + dumps; runs `clp-sync` |
+| Standby (mirror) | Pulls files + clones site MySQL as root (`mysqldump` over SSH) |
 
 Alternative (git clone):
 

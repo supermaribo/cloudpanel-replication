@@ -12,19 +12,6 @@ local_mysql() {
     --skip-password --batch --force --binary-mode --max-allowed-packet=512M "$@"
 }
 
-kill_stale_mysql_imports() {
-  pkill -f '/var/tmp/clp-sync' 2>/dev/null || true
-  pkill -f 'mysql.*--binary-mode' 2>/dev/null || true
-  local ids
-  ids="$(local_mysql -N -e "SELECT ID FROM information_schema.processlist WHERE ID != CONNECTION_ID() AND COMMAND != 'Sleep';" 2>/dev/null || true)"
-  local id
-  for id in ${ids}; do
-    [[ "${id}" =~ ^[0-9]+$ ]] || continue
-    local_mysql -e "KILL ${id}" 2>/dev/null || true
-  done
-  true
-}
-
 pull_probe() {
   log_info "Probing master ${MASTER_HOST}"
   master_ssh clp-sync-probe | head -5
@@ -33,11 +20,13 @@ pull_probe() {
 pull_panel_sqlite() {
   local dest="${CLP_SYNC_TMP_DIR}/db.sq3"
   log_info "Pulling CloudPanel sqlite snapshot"
-  master_ssh clp-panel-backup >"${dest}"
+  rm -f "${dest}"
+  if ! master_ssh clp-panel-backup >"${dest}"; then
+    die "panel snapshot ssh failed (update /opt/clp-sync on the MASTER too)"
+  fi
   [[ -s "${dest}" ]] || die "empty panel snapshot"
   chmod 600 "${dest}"
   sqlite3 "${dest}" "PRAGMA integrity_check;" | grep -qx ok || die "panel snapshot failed integrity_check"
-  echo "${dest}"
 }
 
 ensure_linux_users() {
@@ -129,8 +118,7 @@ apply_panel_db_local() {
 pull_app_secret() {
   log_info "Pulling CloudPanel .env (APP_SECRET)"
   mkdir -p /home/clp/htdocs/app/files
-  rsync_from_master "/home/clp/htdocs/app/files/.env" "/home/clp/htdocs/app/files/.env" 2>/dev/null || true
-  rsync_from_master "/home/clp/htdocs/app/.env" "/home/clp/htdocs/app/.env" 2>/dev/null || true
+  rsync_from_master "/home/clp/htdocs/app/files/.env" "/home/clp/htdocs/app/files/.env" || true
 }
 
 disable_local_backup_jobs() {
@@ -167,45 +155,57 @@ except sqlite3.Error as e:
 PY
 }
 
+# Clone site databases: root mysqldump on master (stdout) → load on this box.
+# Does not copy mysql.user (that would replace this server's own MySQL root).
 pull_and_import_mysql() {
   local db_snap="$1"
-  local dump_dir="${CLP_SYNC_TMP_DIR}/db"
-  mkdir -p "${dump_dir}"
-  kill_stale_mysql_imports
+  local sql_file="${CLP_SYNC_TMP_DIR}/clone.sql"
+  local -a names=()
+  local site_id domain site_user db_name db_user n m sock password sql_pass
 
-  local site_id domain site_user db_name db_user sql_file n
-  log_info "Pulling MySQL dumps from master and loading locally"
   while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
     [[ -n "${db_name}" ]] || continue
     [[ ",${MYSQL_SKIP_DATABASES}," == *",${db_name},"* ]] && continue
-    sql_file="${dump_dir}/${db_name}.sql"
-    log_info "Dumping ${db_name} from master (stdout, not stored on master)"
-    master_ssh "clp-mysqldump ${db_name}" >"${sql_file}"
-    [[ -s "${sql_file}" ]] || { log_error "empty dump ${db_name}"; return 1; }
-    sed -i '/sandbox mode/d;/^SET @@GLOBAL.GTID_PURGED/d' "${sql_file}" || true
-    n="$(wc -c <"${sql_file}")"
-    log_info "CREATE DATABASE ${db_name}"
-    local_mysql -N -e "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-    log_info "Loading ${db_name} via SOURCE (${n} bytes)"
-    local m sock
-    m=/usr/bin/mysql
-    [[ -x "${m}" ]] || m="$(command -v mysql)"
-    sock=/run/mysqld/mysqld.sock
-    [[ -S "${sock}" ]] || sock=/var/run/mysqld/mysqld.sock
-    if ! timeout 180 "${m}" --no-defaults -u root --protocol=SOCKET --socket="${sock}" \
-      --skip-password --batch --force --binary-mode --max-allowed-packet=512M \
-      -e "SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION UNIQUE_CHECKS=0; source ${sql_file};"; then
-      log_error "SOURCE ${db_name} failed or timed out"
-      local_mysql -e "SHOW PROCESSLIST" || true
-      return 1
-    fi
-    rm -f "${sql_file}"
-    INC_MYSQL_IMPORT=$((INC_MYSQL_IMPORT + 1))
-    log_ok "Imported ${db_name}"
+    [[ "${db_name}" =~ ^[A-Za-z0-9_]+$ ]] || continue
+    names+=("${db_name}")
+  done < <(inventory_databases "${db_snap}")
 
-    local pass sql_pass
+  if ((${#names[@]} == 0)); then
+    log_info "No site databases to clone"
+    return 0
+  fi
+
+  pkill -f 'mysql.*--binary-mode' 2>/dev/null || true
+
+  log_info "Cloning MySQL as root: ${names[*]}"
+  rm -f "${sql_file}"
+  master_ssh "clp-mysqldump ${names[*]}" >"${sql_file}"
+  [[ -s "${sql_file}" ]] || die "empty MySQL dump from master"
+  sed -i '/sandbox mode/d;/^SET @@GLOBAL.GTID_PURGED/d' "${sql_file}" || true
+  n="$(wc -c <"${sql_file}")"
+  log_info "Loading clone locally (${n} bytes)"
+
+  m=/usr/bin/mysql
+  [[ -x "${m}" ]] || m="$(command -v mysql)"
+  sock=/run/mysqld/mysqld.sock
+  [[ -S "${sock}" ]] || sock=/var/run/mysqld/mysqld.sock
+  [[ -S "${sock}" ]] || die "local mysqld socket missing"
+
+  if ! timeout 600 "${m}" --no-defaults -u root --protocol=SOCKET --socket="${sock}" \
+    --skip-password --batch --force --binary-mode --max-allowed-packet=512M \
+    -e "SET SESSION FOREIGN_KEY_CHECKS=0; SET SESSION UNIQUE_CHECKS=0; source ${sql_file};"; then
+    die "MySQL clone import failed or timed out"
+  fi
+  rm -f "${sql_file}"
+  INC_MYSQL_IMPORT=${#names[@]}
+  log_ok "Imported ${#names[@]} database(s)"
+
+  while IFS=$'\t' read -r site_id domain site_user db_name db_user; do
+    [[ -n "${db_name}" && -n "${db_user}" ]] || continue
+    [[ ",${MYSQL_SKIP_DATABASES}," == *",${db_name},"* ]] && continue
+    password=""
     if password="$(guess_db_password "${site_user}" "${domain}" "${db_name}")"; then
-      sql_pass="$(printf '%s' "${password}" | sed "s/'/''/g")"
+      sql_pass="$(sql_escape "${password}")"
       local_mysql -e "
         CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${sql_pass}';
         CREATE USER IF NOT EXISTS '${db_user}'@'127.0.0.1' IDENTIFIED BY '${sql_pass}';
@@ -216,5 +216,5 @@ pull_and_import_mysql() {
         FLUSH PRIVILEGES;" 2>/dev/null || log_warn "Could not GRANT ${db_user}"
     fi
   done < <(inventory_databases "${db_snap}")
-  log_ok "MySQL pull complete"
+  log_ok "MySQL clone complete"
 }

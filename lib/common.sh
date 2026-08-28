@@ -11,7 +11,7 @@ log() {
   local msg="$*"
   local line
   line="$(date -u +'%Y-%m-%dT%H:%M:%SZ') [${level}] ${msg}"
-  echo "${line}"
+  echo "${line}" >&2
   if [[ -n "${CLP_SYNC_LOG_FILE:-}" ]]; then
     echo "${line}" >>"${CLP_SYNC_LOG_FILE}"
   fi

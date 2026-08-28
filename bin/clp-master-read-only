@@ -32,25 +32,33 @@ panel_backup() {
   local src="/home/clp/htdocs/app/data/db.sq3"
   local tmp
   [[ -f "${src}" ]] || { echo "no panel db" >&2; exit 1; }
-  tmp="$(mktemp /var/tmp/clp-panel.XXXXXX.sq3)"
-  trap 'rm -f "${tmp}"' EXIT
+  tmp="$(mktemp /var/tmp/clp-panel.XXXXXX)"
   sqlite3 "${src}" ".backup '${tmp}'"
   cat "${tmp}"
+  rm -f "${tmp}"
 }
 
-dump_db() {
-  local db="$1"
-  db="$(printf '%s' "${db}" | tr -d '[:space:]')"
-  [[ "${db}" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad database name" >&2; exit 1; }
-  case ",${db}," in
-    *,information_schema,*|*,performance_schema,*|*,sys,*|*,mysql,*)
-      echo "refusing system database" >&2
-      exit 1
-      ;;
-  esac
+# Root socket dump of site databases (stdout only). Never dumps mysql/sys.
+dump_dbs() {
+  local -a names=()
+  local db
+  for db in "$@"; do
+    db="$(printf '%s' "${db}" | tr -d '[:space:]')"
+    [[ -n "${db}" ]] || continue
+    [[ "${db}" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad database name" >&2; exit 1; }
+    case ",${db}," in
+      *,information_schema,*|*,performance_schema,*|*,sys,*|*,mysql,*)
+        echo "refusing system database ${db}" >&2
+        exit 1
+        ;;
+    esac
+    names+=("${db}")
+  done
+  ((${#names[@]} > 0)) || { echo "no databases" >&2; exit 1; }
   exec mysqldump --single-transaction --quick --routines --triggers \
-    --skip-dump-date --set-gtid-purged=OFF --default-character-set=utf8mb4 \
-    --no-tablespaces --databases "${db}"
+    --add-drop-database --skip-dump-date --set-gtid-purged=OFF \
+    --default-character-set=utf8mb4 --no-tablespaces \
+    --databases "${names[@]}"
 }
 
 # rsync --server --sender … <path>
@@ -75,7 +83,8 @@ case "${cmd}" in
   clp-sync-probe) probe; exit 0 ;;
   clp-panel-backup) panel_backup; exit 0 ;;
   clp-mysqldump\ *)
-    dump_db "${cmd#clp-mysqldump }"
+    # shellcheck disable=SC2086
+    dump_dbs ${cmd#clp-mysqldump }
     ;;
   "")
     echo "clp-master-read-only: no command (restricted key)" >&2

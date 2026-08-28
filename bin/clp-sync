@@ -81,7 +81,8 @@ if [[ "${DRY_CONNECT_ONLY}" -eq 1 ]]; then
   exit 0
 fi
 
-DB_SNAP="$(pull_panel_sqlite)"
+pull_panel_sqlite
+DB_SNAP="${CLP_SYNC_TMP_DIR}/db.sq3"
 log_info "Inventory snapshot: ${DB_SNAP}"
 
 ensure_linux_users "${DB_SNAP}"
@@ -94,9 +95,6 @@ fi
 if [[ "${SKIP_NGINX}" -eq 0 ]]; then
   pull_nginx_php
 fi
-
-apply_panel_db_local "${DB_SNAP}"
-disable_local_backup_jobs
 
 if [[ "${SKIP_MYSQL}" -eq 0 ]]; then
   pull_and_import_mysql "${DB_SNAP}"
